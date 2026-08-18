@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 #[derive(Debug, Clone, Parser)]
 #[command(version, about = "WireGuard endpoint manager backed by EasyTier")]
@@ -33,6 +33,15 @@ pub struct Config {
 
     #[arg(long, default_value_t = 42_000)]
     pub listener_port_base: u16,
+
+    #[arg(long, default_value = "127.0.0.1:51821")]
+    pub management_listen: SocketAddr,
+
+    #[arg(long, default_value_t = 11_020)]
+    pub public_relay_port: u16,
+
+    #[arg(long)]
+    pub disable_public_relay: bool,
 }
 
 impl Config {

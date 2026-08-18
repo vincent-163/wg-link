@@ -3,11 +3,13 @@ mod config;
 mod discovery;
 mod easytier;
 mod identity;
+mod management;
+mod metrics;
 mod shortcut;
 mod wireguard;
 
 use anyhow::Result;
-use broker::{PathTarget, RelayChannel};
+use broker::{PathSet, PathTarget, RelayChannel};
 use clap::Parser;
 use config::Config;
 use std::{
@@ -45,6 +47,17 @@ async fn main() -> Result<()> {
         )
         .init();
     let config = Config::parse().normalize();
+    let management = management::ManagementState::default();
+    let management_task = tokio::spawn(management::run(
+        config.management_listen,
+        management.clone(),
+    ));
+    if !config.management_listen.ip().is_loopback() {
+        warn!(listen = %config.management_listen, "management interface is exposed beyond loopback");
+    }
+    if !config.disable_public_relay {
+        tokio::spawn(easytier::run_public_relay_service(config.public_relay_port));
+    }
 
     match discovery::stun::public_address(&config.stun).await {
         Ok(address) => info!(server = %config.stun, %address, "STUN public endpoint"),
@@ -79,8 +92,12 @@ async fn main() -> Result<()> {
                         let _ = old.task.await;
                     }
                     let cancel = CancellationToken::new();
-                    let task =
-                        tokio::spawn(run_generation(config.clone(), snapshot, cancel.clone()));
+                    let task = tokio::spawn(run_generation(
+                        config.clone(),
+                        snapshot,
+                        management.clone(),
+                        cancel.clone(),
+                    ));
                     generation = Some(Generation { cancel, task });
                     active_key = Some(key);
                 }
@@ -102,11 +119,19 @@ async fn main() -> Result<()> {
             active_key = None;
         }
         sleep(config.poll_interval()).await;
+        if management_task.is_finished() {
+            return management_task.await?;
+        }
     }
 }
 
-async fn run_generation(config: Config, snapshot: wireguard::Snapshot, cancel: CancellationToken) {
-    if let Err(error) = run_generation_inner(config, snapshot, cancel).await {
+async fn run_generation(
+    config: Config,
+    snapshot: wireguard::Snapshot,
+    management: management::ManagementState,
+    cancel: CancellationToken,
+) {
+    if let Err(error) = run_generation_inner(config, snapshot, management, cancel).await {
         error!(%error, "wg-link generation failed");
     }
 }
@@ -114,6 +139,7 @@ async fn run_generation(config: Config, snapshot: wireguard::Snapshot, cancel: C
 async fn run_generation_inner(
     config: Config,
     snapshot: wireguard::Snapshot,
+    management: management::ManagementState,
     cancel: CancellationToken,
 ) -> Result<()> {
     info!(
@@ -127,7 +153,7 @@ async fn run_generation_inner(
 
     const SHORTCUT_TUN: &str = "wgls0";
     let interface_addresses = wireguard::interface_addresses(&config.interface)?;
-    let mut path_maps = HashMap::<String, Arc<RwLock<Vec<PathTarget>>>>::new();
+    let mut path_maps = HashMap::<String, Arc<RwLock<PathSet>>>::new();
     let mut inbound_senders = HashMap::<String, mpsc::Sender<Vec<u8>>>::new();
     let mut broker_tasks = Vec::new();
     let mut baselines = HashMap::<String, u64>::new();
@@ -141,13 +167,14 @@ async fn run_generation_inner(
             &[&snapshot.public_key, &peer.public_key],
         );
         wireguard::set_endpoint(&config.interface, &peer.public_key, peer_port)?;
-        let paths = Arc::new(RwLock::new(Vec::new()));
+        let paths = Arc::new(RwLock::new(PathSet::default()));
         let (inbound_sender, inbound_receiver) = mpsc::channel(256);
         broker_tasks.push(tokio::spawn(broker::run_peer(
             peer.public_key.clone(),
             peer_port,
             snapshot.listen_port,
             paths.clone(),
+            management.metrics.clone(),
             inbound_receiver,
             cancel.child_token(),
         )));
@@ -159,9 +186,12 @@ async fn run_generation_inner(
 
     let mut relay_tasks = Vec::new();
     let (shortcut_inbound_sender, mut shortcut_inbound_receiver) = mpsc::channel(256);
-    let mut shortcut_outbound = None;
-    for relay in &config.relays {
-        let provider = format!("easytier|{relay}");
+    for (relay_index, relay) in config.relays.iter().enumerate() {
+        let path_id = format!("et-{}", &blake3::hash(relay.as_bytes()).to_hex()[..12]);
+        let protocol = url::Url::parse(relay)
+            .ok()
+            .map(|url| url.scheme().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         let listener_port = identity::derive_port(
             config.listener_port_base,
             3_500,
@@ -169,7 +199,6 @@ async fn run_generation_inner(
             &[&snapshot.public_key, relay],
         );
         let (relay_sender, relay_receiver) = mpsc::channel(256);
-        shortcut_outbound.get_or_insert_with(|| relay_sender.clone());
         let mut peer_routes = Vec::new();
         for peer in &snapshot.peers {
             peer_routes.push(easytier::PeerRoute {
@@ -180,8 +209,11 @@ async fn run_generation_inner(
                     .clone(),
             });
             if let Some(paths) = path_maps.get(&peer.public_key) {
-                paths.write().await.push(PathTarget {
-                    provider: provider.clone(),
+                management.metrics.register_path(&peer.public_key, &path_id);
+                paths.write().await.targets.push(PathTarget {
+                    id: path_id.clone(),
+                    label: format!("relay-{}", relay_index + 1),
+                    protocol: protocol.clone(),
                     sender: relay_sender.clone(),
                 });
             }
@@ -190,17 +222,35 @@ async fn run_generation_inner(
             config.clone(),
             easytier::RelaySpec {
                 local_public_key: snapshot.public_key.clone(),
+                path_id: path_id.clone(),
                 relay: relay.clone(),
                 listener_port,
                 peers: peer_routes,
                 shortcut_inbound: shortcut_inbound_sender.clone(),
                 outbound: relay_receiver,
+                metrics: management.metrics.clone(),
             },
             cancel.child_token(),
         )));
     }
 
-    let shortcut_outbound = shortcut_outbound.expect("at least one relay is required");
+    management
+        .replace_generation(
+            &config.interface,
+            path_maps
+                .iter()
+                .map(|(peer_key, paths)| (peer_key.clone(), paths.clone()))
+                .collect(),
+        )
+        .await;
+
+    let (shortcut_outbound, shortcut_dispatch_receiver) = mpsc::channel(256);
+    let shortcut_dispatch_task = tokio::spawn(broker::run_dispatcher(
+        path_maps.clone(),
+        management.metrics.clone(),
+        shortcut_dispatch_receiver,
+        cancel.child_token(),
+    ));
     let device_runtime = shortcut::device::start(SHORTCUT_TUN, cancel.child_token())?;
     let shortcut::device::DeviceRuntime {
         handle: device,
@@ -348,6 +398,11 @@ async fn run_generation_inner(
     }
     for task in broker_tasks {
         let _ = task.await;
+    }
+    match shortcut_dispatch_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "shortcut path dispatcher stopped with error"),
+        Err(error) => warn!(%error, "shortcut path dispatcher task failed"),
     }
     for task in relay_tasks {
         match task.await {

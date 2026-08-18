@@ -966,6 +966,7 @@ impl ForeignNetworkManager {
                 .data
                 .get_network_entry(&peer_network.network_name)
                 .is_none()
+            && (!relay_peer_rpc || ret.is_err())
         {
             return Err(anyhow::anyhow!(
                 "foreign network {} is not established by a secret-verified peer yet",

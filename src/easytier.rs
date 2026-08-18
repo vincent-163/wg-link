@@ -2,6 +2,7 @@ use crate::{
     broker::{InboundRelayPacket, RelayChannel, RelayPacket},
     config::Config,
     discovery, identity,
+    metrics::MetricsRegistry,
     shortcut::{control::ShortcutId, state::SessionKey},
 };
 use anyhow::{Context, Result};
@@ -15,7 +16,7 @@ use easytier::{
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +27,8 @@ const LEGACY_FRAME_MAGIC: &[u8; 8] = b"WGLINK01";
 const TYPED_FRAME_MAGIC: &[u8; 8] = b"WGLINK02";
 const MAX_KEY_LEN: usize = 128;
 const SHORTCUT_CHANNEL: u8 = 1;
+const PROBE_REQUEST_CHANNEL: u8 = 2;
+const PROBE_RESPONSE_CHANNEL: u8 = 3;
 
 #[derive(Debug)]
 pub struct PeerRoute {
@@ -36,11 +39,13 @@ pub struct PeerRoute {
 #[derive(Debug)]
 pub struct RelaySpec {
     pub local_public_key: String,
+    pub path_id: String,
     pub relay: String,
     pub listener_port: u16,
     pub peers: Vec<PeerRoute>,
     pub shortcut_inbound: mpsc::Sender<InboundRelayPacket>,
     pub outbound: mpsc::Receiver<RelayPacket>,
+    pub metrics: MetricsRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +59,9 @@ struct WgPacketFilter {
     local_public_key: String,
     peers: HashMap<String, mpsc::Sender<Vec<u8>>>,
     shortcut_inbound: mpsc::Sender<InboundRelayPacket>,
+    probe_inbound: mpsc::Sender<InboundRelayPacket>,
+    path_id: String,
+    metrics: MetricsRegistry,
 }
 
 #[async_trait]
@@ -76,6 +84,8 @@ impl PeerPacketFilter for WgPacketFilter {
                 let Some(sender) = self.peers.get(frame.source) else {
                     return Some(packet);
                 };
+                self.metrics
+                    .record_rx(frame.source, &self.path_id, frame.payload.len());
                 if sender.try_send(frame.payload.to_vec()).is_err() {
                     debug!(peer = %short(frame.source), "dropping received WireGuard packet because broker is busy");
                 }
@@ -91,6 +101,19 @@ impl PeerPacketFilter for WgPacketFilter {
                     .is_err()
                 {
                     debug!(peer = %short(frame.source), ?session, "dropping received shortcut packet because device is busy");
+                }
+            }
+            RelayChannel::PathProbe { .. } => {
+                if self
+                    .probe_inbound
+                    .try_send(InboundRelayPacket {
+                        source_key: frame.source.to_string(),
+                        channel: frame.channel,
+                        payload: frame.payload.to_vec(),
+                    })
+                    .is_err()
+                {
+                    debug!(peer = %short(frame.source), path = %self.path_id, "dropping path probe because receiver is busy");
                 }
             }
         }
@@ -117,6 +140,7 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
         .map(|peer| (peer.public_key.clone(), peer.inbound.clone()))
         .collect::<HashMap<_, _>>();
     let mut outbound = spec.outbound;
+    let (probe_tx, mut probe_rx) = mpsc::channel(256);
 
     let loader = TomlConfigLoader::new_from_str(&config_text)
         .context("failed to parse generated EasyTier config")?;
@@ -132,6 +156,9 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
             local_public_key: spec.local_public_key.clone(),
             peers: inbound,
             shortcut_inbound: spec.shortcut_inbound.clone(),
+            probe_inbound: probe_tx,
+            path_id: spec.path_id.clone(),
+            metrics: spec.metrics.clone(),
         })
         .await;
 
@@ -157,6 +184,8 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
     let mut candidate_urls = HashSet::new();
 
     let mut peer_ids_by_hostname = HashMap::<String, u32>::new();
+    let mut pending_probes = HashMap::<u64, (String, Instant)>::new();
+    let mut next_probe_nonce = 1u64;
     let mut refresh = tokio::time::interval(Duration::from_secs(1));
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -193,13 +222,90 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
                     );
                 }
                 let mut discovered = HashMap::new();
+                let mut discovered_latencies = HashMap::new();
                 for route in peer_manager.list_routes().await {
                     if peer_ids_by_hostname.get(&route.hostname) != Some(&route.peer_id) {
                         debug!(relay = %spec.relay, peer_id = route.peer_id, hostname = %route.hostname, "resolved EasyTier hostname to peer_id");
                     }
+                    discovered_latencies.insert(route.hostname.clone(), route.path_latency as f64);
                     discovered.insert(route.hostname, route.peer_id);
                 }
                 peer_ids_by_hostname = discovered;
+
+                let now = Instant::now();
+                let expired = pending_probes
+                    .iter()
+                    .filter(|(_, (_, sent))| now.saturating_duration_since(*sent) > Duration::from_secs(3))
+                    .map(|(nonce, _)| *nonce)
+                    .collect::<Vec<_>>();
+                for nonce in expired {
+                    if let Some((peer_key, _)) = pending_probes.remove(&nonce) {
+                        spec.metrics.record_probe(&peer_key, &spec.path_id, None);
+                    }
+                }
+
+                for peer in &spec.peers {
+                    let resolved = resolve_peer_id(&peer_ids_by_hostname, &peer.public_key, unix_now());
+                    spec.metrics.set_available(&peer.public_key, &spec.path_id, resolved.is_some());
+                    let Some((_, hostname, dst_peer_id)) = resolved else {
+                        spec.metrics.set_route_latency(&peer.public_key, &spec.path_id, None);
+                        continue;
+                    };
+                    spec.metrics.set_route_latency(
+                        &peer.public_key,
+                        &spec.path_id,
+                        discovered_latencies.get(&hostname).copied(),
+                    );
+                    let nonce = next_probe_nonce;
+                    next_probe_nonce = next_probe_nonce.wrapping_add(1).max(1);
+                    let frame = encode_frame(
+                        &spec.local_public_key,
+                        &peer.public_key,
+                        RelayChannel::PathProbe {
+                            nonce,
+                            sent_micros: unix_micros(),
+                            reply: false,
+                        },
+                        b"p",
+                    );
+                    let mut packet = ZCPacket::new_with_payload(&frame);
+                    packet.fill_peer_manager_hdr(peer_manager.my_peer_id(), dst_peer_id, PacketType::Data as u8);
+                    if peer_manager.send_msg_for_proxy(packet, dst_peer_id).await.is_ok() {
+                        pending_probes.insert(nonce, (peer.public_key.clone(), now));
+                    } else {
+                        spec.metrics.record_probe(&peer.public_key, &spec.path_id, None);
+                    }
+                }
+            }
+            probe = probe_rx.recv() => {
+                let Some(probe) = probe else { break; };
+                let RelayChannel::PathProbe { nonce, sent_micros, reply } = probe.channel else {
+                    continue;
+                };
+                if reply {
+                    if let Some((peer_key, sent)) = pending_probes.remove(&nonce) {
+                        if peer_key == probe.source_key {
+                            spec.metrics.record_probe(&peer_key, &spec.path_id, Some(sent.elapsed()));
+                        }
+                    }
+                    continue;
+                }
+                let Some((_, _, dst_peer_id)) = resolve_peer_id(
+                    &peer_ids_by_hostname,
+                    &probe.source_key,
+                    unix_now(),
+                ) else {
+                    continue;
+                };
+                let frame = encode_frame(
+                    &spec.local_public_key,
+                    &probe.source_key,
+                    RelayChannel::PathProbe { nonce, sent_micros, reply: true },
+                    b"p",
+                );
+                let mut packet = ZCPacket::new_with_payload(&frame);
+                packet.fill_peer_manager_hdr(peer_manager.my_peer_id(), dst_peer_id, PacketType::Data as u8);
+                let _ = peer_manager.send_msg_for_proxy(packet, dst_peer_id).await;
             }
             packet = outbound.recv() => {
                 let Some(packet) = packet else { break; };
@@ -224,8 +330,10 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
                     PacketType::Data as u8,
                 );
                 if let Err(error) = peer_manager.send_msg_for_proxy(zc_packet, dst_peer_id).await {
+                    spec.metrics.set_available(&packet.peer_key, &spec.path_id, false);
                     warn!(relay = %spec.relay, peer = %short(&packet.peer_key), dst_peer_id, %error, "EasyTier peer_id send failed");
                 } else {
+                    spec.metrics.record_tx(&packet.peer_key, &spec.path_id, packet.payload.len());
                     debug!(relay = %spec.relay, peer = %short(&packet.peer_key), target_period, %target_hostname, dst_peer_id, bytes = packet.payload.len(), "sent WireGuard packet by EasyTier peer_id");
                 }
             }
@@ -235,6 +343,34 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
     let _ = discovery_task.await;
     instance.clear_resources().await;
     Ok(())
+}
+
+pub async fn run_public_relay_service(port: u16) -> Result<()> {
+    let relay_network = format!("__wg_link_relay_{:032x}", rand::random::<u128>());
+    let relay_secret = format!("{:032x}", rand::random::<u128>());
+    let allowed_network = identity::transport_network();
+    loop {
+        let config_text =
+            build_public_relay_config(port, &relay_network, &relay_secret, &allowed_network);
+        let loader = TomlConfigLoader::new_from_str(&config_text)
+            .context("failed to parse generated EasyTier public relay config")?;
+        let mut instance = Instance::new(loader);
+        match instance.run().await {
+            Ok(()) => {
+                info!(
+                    port,
+                    protocols = "udp,tcp",
+                    "embedded EasyTier pure relay listening"
+                );
+                instance.get_peer_manager().wait().await;
+                instance.clear_resources().await;
+            }
+            Err(error) => {
+                warn!(port, %error, "embedded EasyTier pure relay failed; retrying");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 async fn run_discovery_loop(
@@ -396,6 +532,20 @@ fn build_config(
     text
 }
 
+fn build_public_relay_config(
+    port: u16,
+    network_name: &str,
+    network_secret: &str,
+    allowed_network: &str,
+) -> String {
+    format!(
+        "instance_name = \"wg-link-public-relay\"\nhostname = \"wg-link-public-relay\"\ndhcp = false\nlisteners = [\"udp://0.0.0.0:{port}\", \"tcp://0.0.0.0:{port}\"]\n\n[network_identity]\nnetwork_name = {}\nnetwork_secret = {}\n\n[flags]\nno_tun = true\nuse_smoltcp = true\nprivate_mode = false\nrelay_all_peer_rpc = true\nrelay_network_whitelist = {}\ndisable_p2p = true\ndisable_udp_hole_punching = true\ndisable_tcp_hole_punching = true\nmulti_thread = false\n",
+        toml_string(network_name),
+        toml_string(network_secret),
+        toml_string(allowed_network),
+    )
+}
+
 fn resolve_peer_id(
     peer_ids_by_hostname: &HashMap<String, u32>,
     peer_key: &str,
@@ -417,6 +567,13 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn unix_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
 struct DecodedFrame<'a> {
     source: &'a str,
     target: &'a str,
@@ -436,6 +593,19 @@ fn encode_frame(source: &str, target: &str, channel: RelayChannel, payload: &[u8
             frame.push(SHORTCUT_CHANNEL);
             frame.extend_from_slice(&session.shortcut_id.0);
             frame.extend_from_slice(&session.epoch.to_be_bytes());
+        }
+        RelayChannel::PathProbe {
+            nonce,
+            sent_micros,
+            reply,
+        } => {
+            frame.push(if reply {
+                PROBE_RESPONSE_CHANNEL
+            } else {
+                PROBE_REQUEST_CHANNEL
+            });
+            frame.extend_from_slice(&nonce.to_be_bytes());
+            frame.extend_from_slice(&sent_micros.to_be_bytes());
         }
     }
     frame.extend_from_slice(&(source.len() as u16).to_be_bytes());
@@ -467,26 +637,63 @@ fn decode_frame(frame: &[u8]) -> Option<DecodedFrame<'_>> {
             payload,
         });
     }
-    if frame.len() < TYPED_FRAME_MAGIC.len() + 29
-        || !frame.starts_with(TYPED_FRAME_MAGIC)
-        || frame[TYPED_FRAME_MAGIC.len()] != SHORTCUT_CHANNEL
-    {
+    if frame.len() < TYPED_FRAME_MAGIC.len() + 21 || !frame.starts_with(TYPED_FRAME_MAGIC) {
         return None;
     }
-    let session_offset = TYPED_FRAME_MAGIC.len() + 1;
-    let shortcut_id = ShortcutId(frame[session_offset..session_offset + 16].try_into().ok()?);
-    let epoch = u64::from_be_bytes(
-        frame[session_offset + 16..session_offset + 24]
-            .try_into()
-            .ok()?,
-    );
-    let (source, target, payload) = decode_keys_and_payload(frame, session_offset + 24)?;
+    let channel_id = frame[TYPED_FRAME_MAGIC.len()];
+    let metadata_offset = TYPED_FRAME_MAGIC.len() + 1;
+    let (channel, lengths_offset) = match channel_id {
+        SHORTCUT_CHANNEL => {
+            if frame.len() < metadata_offset + 24 + 4 {
+                return None;
+            }
+            let shortcut_id = ShortcutId(
+                frame[metadata_offset..metadata_offset + 16]
+                    .try_into()
+                    .ok()?,
+            );
+            let epoch = u64::from_be_bytes(
+                frame[metadata_offset + 16..metadata_offset + 24]
+                    .try_into()
+                    .ok()?,
+            );
+            (
+                RelayChannel::ShortcutWireGuard {
+                    session: SessionKey { shortcut_id, epoch },
+                },
+                metadata_offset + 24,
+            )
+        }
+        PROBE_REQUEST_CHANNEL | PROBE_RESPONSE_CHANNEL => {
+            if frame.len() < metadata_offset + 16 + 4 {
+                return None;
+            }
+            let nonce = u64::from_be_bytes(
+                frame[metadata_offset..metadata_offset + 8]
+                    .try_into()
+                    .ok()?,
+            );
+            let sent_micros = u64::from_be_bytes(
+                frame[metadata_offset + 8..metadata_offset + 16]
+                    .try_into()
+                    .ok()?,
+            );
+            (
+                RelayChannel::PathProbe {
+                    nonce,
+                    sent_micros,
+                    reply: channel_id == PROBE_RESPONSE_CHANNEL,
+                },
+                metadata_offset + 16,
+            )
+        }
+        _ => return None,
+    };
+    let (source, target, payload) = decode_keys_and_payload(frame, lengths_offset)?;
     Some(DecodedFrame {
         source,
         target,
-        channel: RelayChannel::ShortcutWireGuard {
-            session: SessionKey { shortcut_id, epoch },
-        },
+        channel,
         payload,
     })
 }
@@ -588,6 +795,46 @@ mod tests {
         assert_eq!(decoded.target, "target");
         assert_eq!(decoded.channel, RelayChannel::ShortcutWireGuard { session });
         assert_eq!(decoded.payload, b"shortcut");
+    }
+
+    #[test]
+    fn probe_frame_round_trip() {
+        let channel = RelayChannel::PathProbe {
+            nonce: 42,
+            sent_micros: 123_456,
+            reply: true,
+        };
+        let frame = encode_frame("source", "target", channel, b"p");
+        let decoded = decode_frame(&frame).unwrap();
+        assert_eq!(decoded.source, "source");
+        assert_eq!(decoded.target, "target");
+        assert_eq!(decoded.channel, channel);
+        assert_eq!(decoded.payload, b"p");
+    }
+
+    #[test]
+    fn truncated_typed_frames_are_rejected() {
+        for channel in [
+            SHORTCUT_CHANNEL,
+            PROBE_REQUEST_CHANNEL,
+            PROBE_RESPONSE_CHANNEL,
+        ] {
+            let mut frame = TYPED_FRAME_MAGIC.to_vec();
+            frame.push(channel);
+            frame.resize(28, 0);
+            assert!(decode_frame(&frame).is_none());
+        }
+    }
+
+    #[test]
+    fn public_relay_config_is_valid_and_isolated() {
+        let text =
+            build_public_relay_config(11_020, "isolated-network", "secret", "allowed-network");
+        TomlConfigLoader::new_from_str(&text).unwrap();
+        assert!(!text.contains("[[peer]]"));
+        assert!(text.contains("no_tun = true"));
+        assert!(text.contains("relay_all_peer_rpc = true"));
+        assert!(text.contains("relay_network_whitelist = \"allowed-network\""));
     }
 
     #[test]

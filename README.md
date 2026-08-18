@@ -29,6 +29,24 @@ For each peer it:
 - treats a newer WireGuard `latest_handshake` value as authenticated success;
 - continuously restores the managed endpoint if WireGuard roaming changes it.
 
+The daemon exposes a loopback-only management console at
+`http://127.0.0.1:51821/` by default. It shows the selected and active path for
+every peer, per-path EasyTier route latency, active-probe RTT and packet loss
+over at most the latest 100 probes/60 seconds, plus transmit and receive EWMA
+rates over 5 seconds, 1 minute, and 1 hour. A healthy relay/protocol path can be
+selected manually, or selection can be returned to automatic fallback. Change
+the bind address with `--management-listen`; binding a non-loopback address is
+explicitly warned because the console intentionally omits relay URLs and full
+WireGuard public keys.
+
+Every process also starts an embedded EasyTier relay listener on UDP and TCP
+port `11020`. It has no TUN device and no configured peers, uses a random
+isolated local network identity, and accepts only the wg-link transport network
+as a foreign network. This keeps it out of the virtual overlay while allowing
+other wg-link nodes to use it as a pure in-process relay. Use
+`--public-relay-port` to change the port or `--disable-public-relay` when
+another service already owns it.
+
 Discovery providers are optional. STUN defaults to
 `stun.cloudflare.com:3478`; HTTP trackers, UDP trackers, and Mainline DHT can
 feed additional public UDP candidates into the running EasyTier connector.
