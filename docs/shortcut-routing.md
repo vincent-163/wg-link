@@ -295,6 +295,54 @@ immediately and returns traffic to `A`.
 `A` stops renewal when either base peer is removed, its relevant `AllowedIPs`
 change, or the route no longer selects the same downstream peer.
 
+## Chained shortcut convergence
+
+Shortcut sessions remain eligible as authenticated control paths. This lets a
+long route converge one transit at a time without requiring the original first
+hop to understand the complete topology.
+
+For a path `L -> A -> B -> C`:
+
+1. `A` observes the base-path packet and creates the `L <-> B` shortcut while
+   still forwarding the packet normally.
+2. Only after the `L <-> B` shortcut handshake authenticates may `L` route the
+   delegated destination selector directly to `B`.
+3. When `B` decrypts a packet from the authenticated `L` shortcut session, it
+   already knows the stable identity bound to that ephemeral session. Before
+   injecting the packet into `wgls0`, `B` performs a longest-prefix lookup in
+   its current base-WireGuard `AllowedIPs` table. If the next hop is `C`, `B`
+   forwards the packet normally and concurrently creates an `L <-> C` child
+   shortcut.
+4. `B` sends the upstream child ticket to `L` over the authenticated `L <-> B`
+   shortcut control channel, and sends the downstream ticket to `C` over its
+   authenticated base-WireGuard channel. The ordinary routed base path remains
+   a fallback for control delivery.
+5. `L` and `C` install their child routes only after their own `L <-> C`
+   userspace-WireGuard handshake succeeds. The older `L <-> B` shortcut remains
+   available for unrelated selectors and control renewal.
+6. The same rule can repeat at `C`, progressively reducing `L -> A -> B -> C ->
+   D` to `L <-> D` without creating a temporary forwarding black hole.
+
+Each child ticket contains a bounded delegation lineage: root shortcut ID,
+parent shortcut ID, depth, remaining delegation budget, and hashed issuer
+fingerprints. A node refuses repeated issuers, exhausted budgets, self-links,
+or children whose lifetime would exceed their authenticated parent control
+lease. The maximum depth is eight by default. This prevents routing loops and
+unbounded ticket amplification without publishing the original internal path.
+
+The child uses two directional selectors: the upstream endpoint receives the
+destination prefix behind the downstream node, while the downstream endpoint
+receives the source prefix behind the upstream node. Both tickets share one
+shortcut ID and master secret, but are accepted only when the declared issuer
+matches the stable identity of the authenticated base or shortcut control
+channel that delivered the ticket.
+
+Shortcut decryption, rather than a kernel TUN address, supplies the upstream
+identity for chained detection. The userspace engine associates every inner
+packet with its authenticated shortcut session before writing it to `wgls0`,
+so no virtual `/24`, packet-source guess, or leaked internal endpoint metadata
+is required.
+
 ## Failure and crash behavior
 
 | Failure | Result |

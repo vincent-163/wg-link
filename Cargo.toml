@@ -11,8 +11,10 @@ description = "Public-key-addressed WireGuard endpoint manager using embedded Ea
 anyhow = "1.0"
 async-trait = "0.1"
 blake3 = "1.8"
+boringtun = "0.7.1"
 clap = { version = "4.5", features = ["derive"] }
 futures-lite = "2.6"
+ipnet = { version = "2.11", features = ["serde"] }
 mainline = "8.0"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -23,8 +25,10 @@ serde_bytes = "0.11"
 serde_json = "1.0"
 sha1 = "0.10"
 tokio = { version = "1.47", features = ["full"] }
+tokio-tun = "0.15.2"
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
 url = "2.5"
+zeroize = { version = "1.8", features = ["derive"] }

@@ -3,6 +3,7 @@ mod config;
 mod discovery;
 mod easytier;
 mod identity;
+mod shortcut;
 mod wireguard;
 
 use anyhow::Result;
@@ -23,7 +24,7 @@ use tracing_subscriber::EnvFilter;
 struct GenerationKey {
     public_key: String,
     listen_port: u16,
-    peers: Vec<String>,
+    peers: Vec<(String, Vec<String>)>,
 }
 
 struct Generation {
@@ -51,10 +52,15 @@ async fn main() -> Result<()> {
     loop {
         match wireguard::snapshot(&config.interface) {
             Ok(snapshot) => {
-                let mut peers: Vec<String> = snapshot
+                let mut peers: Vec<(String, Vec<String>)> = snapshot
                     .peers
                     .iter()
-                    .map(|peer| peer.public_key.clone())
+                    .map(|peer| {
+                        let mut allowed_ips: Vec<String> =
+                            peer.allowed_ips.iter().map(ToString::to_string).collect();
+                        allowed_ips.sort();
+                        (peer.public_key.clone(), allowed_ips)
+                    })
                     .collect();
                 peers.sort();
                 let key = GenerationKey {
