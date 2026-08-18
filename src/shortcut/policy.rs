@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use std::{
     collections::HashMap,
+    net::IpAddr,
     process::{Command, Output},
 };
 
@@ -62,6 +63,7 @@ pub struct SystemPolicy {
     tun_name: String,
     table: u32,
     priority_base: u32,
+    source: Option<IpAddr>,
 }
 
 impl SystemPolicy {
@@ -70,11 +72,22 @@ impl SystemPolicy {
             tun_name: tun_name.into(),
             table: DEFAULT_TABLE,
             priority_base: DEFAULT_RULE_PRIORITY_BASE,
+            source: None,
+        }
+    }
+
+    pub fn new_with_source(tun_name: impl Into<String>, source: IpAddr) -> Self {
+        Self {
+            tun_name: tun_name.into(),
+            table: DEFAULT_TABLE,
+            priority_base: DEFAULT_RULE_PRIORITY_BASE,
+            source: Some(source),
         }
     }
 
     fn prepare(&self, selector: IpNet) -> Result<()> {
         let table = self.table.to_string();
+        let source = self.source.map(|source| source.to_string());
         let mut arguments = Vec::new();
         if selector.addr().is_ipv6() {
             arguments.push("-6");
@@ -88,6 +101,9 @@ impl SystemPolicy {
             "table",
             table.as_str(),
         ]);
+        if let Some(source) = source.as_deref() {
+            arguments.extend(["src", source]);
+        }
         run_ip(arguments)?;
         Ok(())
     }

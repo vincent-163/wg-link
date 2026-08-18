@@ -1,4 +1,9 @@
-use crate::{broker::RelayPacket, config::Config, discovery, identity};
+use crate::{
+    broker::{InboundRelayPacket, RelayChannel, RelayPacket},
+    config::Config,
+    discovery, identity,
+    shortcut::{control::ShortcutId, state::SessionKey},
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use easytier::{
@@ -17,8 +22,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
 
-const FRAME_MAGIC: &[u8; 8] = b"WGLINK01";
+const LEGACY_FRAME_MAGIC: &[u8; 8] = b"WGLINK01";
+const TYPED_FRAME_MAGIC: &[u8; 8] = b"WGLINK02";
 const MAX_KEY_LEN: usize = 128;
+const SHORTCUT_CHANNEL: u8 = 1;
 
 #[derive(Debug)]
 pub struct PeerRoute {
@@ -32,6 +39,7 @@ pub struct RelaySpec {
     pub relay: String,
     pub listener_port: u16,
     pub peers: Vec<PeerRoute>,
+    pub shortcut_inbound: mpsc::Sender<InboundRelayPacket>,
     pub outbound: mpsc::Receiver<RelayPacket>,
 }
 
@@ -45,6 +53,7 @@ struct DiscoveryContext {
 struct WgPacketFilter {
     local_public_key: String,
     peers: HashMap<String, mpsc::Sender<Vec<u8>>>,
+    shortcut_inbound: mpsc::Sender<InboundRelayPacket>,
 }
 
 #[async_trait]
@@ -56,17 +65,34 @@ impl PeerPacketFilter for WgPacketFilter {
         if header.packet_type != PacketType::Data as u8 {
             return Some(packet);
         }
-        let Some((source, target, payload)) = decode_frame(packet.payload()) else {
+        let Some(frame) = decode_frame(packet.payload()) else {
             return Some(packet);
         };
-        if target != self.local_public_key {
+        if frame.target != self.local_public_key {
             return Some(packet);
         }
-        let Some(sender) = self.peers.get(source) else {
-            return Some(packet);
-        };
-        if sender.try_send(payload.to_vec()).is_err() {
-            debug!(peer = %short(source), "dropping received WireGuard packet because broker is busy");
+        match frame.channel {
+            RelayChannel::BaseWireGuard => {
+                let Some(sender) = self.peers.get(frame.source) else {
+                    return Some(packet);
+                };
+                if sender.try_send(frame.payload.to_vec()).is_err() {
+                    debug!(peer = %short(frame.source), "dropping received WireGuard packet because broker is busy");
+                }
+            }
+            RelayChannel::ShortcutWireGuard { session } => {
+                if self
+                    .shortcut_inbound
+                    .try_send(InboundRelayPacket {
+                        source_key: frame.source.to_string(),
+                        channel: RelayChannel::ShortcutWireGuard { session },
+                        payload: frame.payload.to_vec(),
+                    })
+                    .is_err()
+                {
+                    debug!(peer = %short(frame.source), ?session, "dropping received shortcut packet because device is busy");
+                }
+            }
         }
         None
     }
@@ -85,19 +111,6 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
             .collect(),
     };
     let config_text = build_config(&config, &spec, &network_name, &[]);
-    let peer_names: HashMap<String, String> = spec
-        .peers
-        .iter()
-        .map(|peer| {
-            (
-                peer.public_key.clone(),
-                format!(
-                    "wgl-{}",
-                    identity::provider_node_id(&peer.public_key, &provider)
-                ),
-            )
-        })
-        .collect();
     let inbound = spec
         .peers
         .iter()
@@ -117,6 +130,7 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
         .add_peer_packet_filter(WgPacketFilter {
             local_public_key: spec.local_public_key.clone(),
             peers: inbound,
+            shortcut_inbound: spec.shortcut_inbound.clone(),
         })
         .await;
 
@@ -141,7 +155,7 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
     let conn_manager = instance.get_conn_manager();
     let mut candidate_urls = HashSet::new();
 
-    let mut peer_ids = HashMap::<String, u32>::new();
+    let mut peer_ids_by_hostname = HashMap::<String, u32>::new();
     let mut refresh = tokio::time::interval(Duration::from_secs(1));
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -164,22 +178,29 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
             _ = refresh.tick() => {
                 let mut discovered = HashMap::new();
                 for route in peer_manager.list_routes().await {
-                    if let Some((public_key, _)) = peer_names.iter().find(|(_, hostname)| *hostname == &route.hostname) {
-                        if peer_ids.get(public_key) != Some(&route.peer_id) {
-                            info!(relay = %spec.relay, peer = %short(public_key), peer_id = route.peer_id, hostname = %route.hostname, "resolved WireGuard peer to EasyTier peer_id");
-                        }
-                        discovered.insert(public_key.clone(), route.peer_id);
+                    if peer_ids_by_hostname.get(&route.hostname) != Some(&route.peer_id) {
+                        debug!(relay = %spec.relay, peer_id = route.peer_id, hostname = %route.hostname, "resolved EasyTier hostname to peer_id");
                     }
+                    discovered.insert(route.hostname, route.peer_id);
                 }
-                peer_ids = discovered;
+                peer_ids_by_hostname = discovered;
             }
             packet = outbound.recv() => {
                 let Some(packet) = packet else { break; };
-                let Some(&dst_peer_id) = peer_ids.get(&packet.peer_key) else {
+                let target_hostname = format!(
+                    "wgl-{}",
+                    identity::provider_node_id(&packet.peer_key, &provider)
+                );
+                let Some(&dst_peer_id) = peer_ids_by_hostname.get(&target_hostname) else {
                     debug!(relay = %spec.relay, peer = %short(&packet.peer_key), "dropping WireGuard packet until EasyTier peer_id is resolved");
                     continue;
                 };
-                let frame = encode_frame(&spec.local_public_key, &packet.peer_key, &packet.payload);
+                let frame = encode_frame(
+                    &spec.local_public_key,
+                    &packet.peer_key,
+                    packet.channel,
+                    &packet.payload,
+                );
                 let mut zc_packet = ZCPacket::new_with_payload(&frame);
                 zc_packet.fill_peer_manager_hdr(
                     peer_manager.my_peer_id(),
@@ -361,9 +382,27 @@ fn build_config(
     text
 }
 
-fn encode_frame(source: &str, target: &str, payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(12 + source.len() + target.len() + payload.len());
-    frame.extend_from_slice(FRAME_MAGIC);
+struct DecodedFrame<'a> {
+    source: &'a str,
+    target: &'a str,
+    channel: RelayChannel,
+    payload: &'a [u8],
+}
+
+fn encode_frame(source: &str, target: &str, channel: RelayChannel, payload: &[u8]) -> Vec<u8> {
+    if channel == RelayChannel::BaseWireGuard {
+        return encode_legacy_frame(source, target, payload);
+    }
+    let mut frame = Vec::with_capacity(37 + source.len() + target.len() + payload.len());
+    frame.extend_from_slice(TYPED_FRAME_MAGIC);
+    match channel {
+        RelayChannel::BaseWireGuard => unreachable!(),
+        RelayChannel::ShortcutWireGuard { session } => {
+            frame.push(SHORTCUT_CHANNEL);
+            frame.extend_from_slice(&session.shortcut_id.0);
+            frame.extend_from_slice(&session.epoch.to_be_bytes());
+        }
+    }
     frame.extend_from_slice(&(source.len() as u16).to_be_bytes());
     frame.extend_from_slice(&(target.len() as u16).to_be_bytes());
     frame.extend_from_slice(source.as_bytes());
@@ -372,18 +411,63 @@ fn encode_frame(source: &str, target: &str, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-fn decode_frame(frame: &[u8]) -> Option<(&str, &str, &[u8])> {
-    if frame.len() < FRAME_MAGIC.len() + 4 || &frame[..FRAME_MAGIC.len()] != FRAME_MAGIC {
+fn encode_legacy_frame(source: &str, target: &str, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(12 + source.len() + target.len() + payload.len());
+    frame.extend_from_slice(LEGACY_FRAME_MAGIC);
+    frame.extend_from_slice(&(source.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&(target.len() as u16).to_be_bytes());
+    frame.extend_from_slice(source.as_bytes());
+    frame.extend_from_slice(target.as_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn decode_frame(frame: &[u8]) -> Option<DecodedFrame<'_>> {
+    if frame.starts_with(LEGACY_FRAME_MAGIC) {
+        let (source, target, payload) = decode_keys_and_payload(frame, LEGACY_FRAME_MAGIC.len())?;
+        return Some(DecodedFrame {
+            source,
+            target,
+            channel: RelayChannel::BaseWireGuard,
+            payload,
+        });
+    }
+    if frame.len() < TYPED_FRAME_MAGIC.len() + 29
+        || !frame.starts_with(TYPED_FRAME_MAGIC)
+        || frame[TYPED_FRAME_MAGIC.len()] != SHORTCUT_CHANNEL
+    {
+        return None;
+    }
+    let session_offset = TYPED_FRAME_MAGIC.len() + 1;
+    let shortcut_id = ShortcutId(frame[session_offset..session_offset + 16].try_into().ok()?);
+    let epoch = u64::from_be_bytes(
+        frame[session_offset + 16..session_offset + 24]
+            .try_into()
+            .ok()?,
+    );
+    let (source, target, payload) = decode_keys_and_payload(frame, session_offset + 24)?;
+    Some(DecodedFrame {
+        source,
+        target,
+        channel: RelayChannel::ShortcutWireGuard {
+            session: SessionKey { shortcut_id, epoch },
+        },
+        payload,
+    })
+}
+
+fn decode_keys_and_payload(frame: &[u8], lengths_offset: usize) -> Option<(&str, &str, &[u8])> {
+    if frame.len() < lengths_offset + 4 {
         return None;
     }
     let source_len =
-        u16::from_be_bytes([frame[FRAME_MAGIC.len()], frame[FRAME_MAGIC.len() + 1]]) as usize;
+        u16::from_be_bytes([frame[lengths_offset], frame[lengths_offset + 1]]) as usize;
     let target_len =
-        u16::from_be_bytes([frame[FRAME_MAGIC.len() + 2], frame[FRAME_MAGIC.len() + 3]]) as usize;
+        u16::from_be_bytes([frame[lengths_offset + 2], frame[lengths_offset + 3]]) as usize;
     if source_len == 0 || target_len == 0 || source_len > MAX_KEY_LEN || target_len > MAX_KEY_LEN {
         return None;
     }
-    let offset = FRAME_MAGIC.len() + 4;
+    let offset = lengths_offset + 4;
     let source_end = offset.checked_add(source_len)?;
     let target_end = source_end.checked_add(target_len)?;
     if target_end >= frame.len() {
@@ -439,16 +523,49 @@ mod tests {
 
     #[test]
     fn frame_round_trip() {
-        let frame = encode_frame("source", "target", b"wireguard");
-        assert_eq!(
-            decode_frame(&frame),
-            Some(("source", "target", &b"wireguard"[..]))
+        let frame = encode_frame(
+            "source",
+            "target",
+            RelayChannel::BaseWireGuard,
+            b"wireguard",
         );
+        let decoded = decode_frame(&frame).unwrap();
+        assert_eq!(decoded.source, "source");
+        assert_eq!(decoded.target, "target");
+        assert_eq!(decoded.channel, RelayChannel::BaseWireGuard);
+        assert_eq!(decoded.payload, b"wireguard");
+    }
+
+    #[test]
+    fn shortcut_frame_round_trip() {
+        let session = SessionKey {
+            shortcut_id: ShortcutId([7; 16]),
+            epoch: 9,
+        };
+        let frame = encode_frame(
+            "source",
+            "target",
+            RelayChannel::ShortcutWireGuard { session },
+            b"shortcut",
+        );
+        let decoded = decode_frame(&frame).unwrap();
+        assert_eq!(decoded.source, "source");
+        assert_eq!(decoded.target, "target");
+        assert_eq!(decoded.channel, RelayChannel::ShortcutWireGuard { session });
+        assert_eq!(decoded.payload, b"shortcut");
     }
 
     #[test]
     fn invalid_frame_is_not_consumed() {
         assert!(decode_frame(b"not wg-link").is_none());
-        assert!(decode_frame(&encode_frame("source", "target", &[])).is_none());
+        assert!(
+            decode_frame(&encode_frame(
+                "source",
+                "target",
+                RelayChannel::BaseWireGuard,
+                &[]
+            ))
+            .is_none()
+        );
     }
 }

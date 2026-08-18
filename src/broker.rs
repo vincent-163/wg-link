@@ -7,9 +7,25 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::shortcut::state::SessionKey;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayChannel {
+    BaseWireGuard,
+    ShortcutWireGuard { session: SessionKey },
+}
+
 #[derive(Debug, Clone)]
 pub struct RelayPacket {
     pub peer_key: String,
+    pub channel: RelayChannel,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboundRelayPacket {
+    pub source_key: String,
+    pub channel: RelayChannel,
     pub payload: Vec<u8>,
 }
 
@@ -56,6 +72,7 @@ pub async fn run_peer(
                 };
                 target.sender.send(RelayPacket {
                     peer_key: peer_key.clone(),
+                    channel: RelayChannel::BaseWireGuard,
                     payload: buffer[..length].to_vec(),
                 }).await.with_context(|| format!("relay path {} stopped", target.provider))?;
                 debug!(peer = %short(&peer_key), provider = %target.provider, bytes = length, "forwarded WireGuard packet by EasyTier peer_id");

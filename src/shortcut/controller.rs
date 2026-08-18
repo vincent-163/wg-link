@@ -1,3 +1,4 @@
+use crate::broker::RelayPacket;
 use crate::shortcut::{
     control::ShortcutTicket,
     device::{DeviceEvent, DeviceHandle},
@@ -30,8 +31,9 @@ impl<R: RouteManager> ShortcutController<R> {
         ticket: ShortcutTicket,
         authenticated_sender: &str,
         now: u64,
-        outbound: mpsc::Sender<Vec<u8>>,
+        outbound: mpsc::Sender<RelayPacket>,
     ) -> Result<SessionKey> {
+        let remote_public_key = ticket.remote_public_key.clone();
         let prepared = self.manager.receive_ticket(
             ticket,
             authenticated_sender,
@@ -39,7 +41,7 @@ impl<R: RouteManager> ShortcutController<R> {
             now,
         )?;
         self.device
-            .prepare(prepared.session, prepared.keys, outbound)
+            .prepare(prepared.session, prepared.keys, remote_public_key, outbound)
             .await?;
         self.manager.mark_handshaking(prepared.session)?;
         Ok(prepared.session)

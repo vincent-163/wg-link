@@ -7,10 +7,15 @@ mod shortcut;
 mod wireguard;
 
 use anyhow::Result;
-use broker::PathTarget;
+use broker::{PathTarget, RelayChannel};
 use clap::Parser;
 use config::Config;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::{
     sync::{RwLock, mpsc},
     task::JoinHandle,
@@ -120,6 +125,8 @@ async fn run_generation_inner(
         "starting embedded wg-link generation"
     );
 
+    const SHORTCUT_TUN: &str = "wgls0";
+    let interface_addresses = wireguard::interface_addresses(&config.interface)?;
     let mut path_maps = HashMap::<String, Arc<RwLock<Vec<PathTarget>>>>::new();
     let mut inbound_senders = HashMap::<String, mpsc::Sender<Vec<u8>>>::new();
     let mut broker_tasks = Vec::new();
@@ -151,6 +158,8 @@ async fn run_generation_inner(
     }
 
     let mut relay_tasks = Vec::new();
+    let (shortcut_inbound_sender, mut shortcut_inbound_receiver) = mpsc::channel(256);
+    let mut shortcut_outbound = None;
     for relay in &config.relays {
         let provider = format!("easytier|{relay}");
         let listener_port = identity::derive_port(
@@ -160,6 +169,7 @@ async fn run_generation_inner(
             &[&snapshot.public_key, relay],
         );
         let (relay_sender, relay_receiver) = mpsc::channel(256);
+        shortcut_outbound.get_or_insert_with(|| relay_sender.clone());
         let mut peer_routes = Vec::new();
         for peer in &snapshot.peers {
             peer_routes.push(easytier::PeerRoute {
@@ -183,15 +193,99 @@ async fn run_generation_inner(
                 relay: relay.clone(),
                 listener_port,
                 peers: peer_routes,
+                shortcut_inbound: shortcut_inbound_sender.clone(),
                 outbound: relay_receiver,
             },
             cancel.child_token(),
         )));
     }
 
+    let shortcut_outbound = shortcut_outbound.expect("at least one relay is required");
+    let device_runtime = shortcut::device::start(SHORTCUT_TUN, cancel.child_token())?;
+    let shortcut::device::DeviceRuntime {
+        handle: device,
+        routes,
+        mut events,
+        task: device_task,
+    } = device_runtime;
+    let route_manager = shortcut::policy::AtomicRouteManager::new(
+        routes,
+        shortcut::policy::SystemPolicy::new_with_source(
+            SHORTCUT_TUN,
+            interface_addresses
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("missing local WireGuard source address"))?,
+        ),
+    );
+    let manager = shortcut::state::ShortcutManager::new(route_manager);
+    let mut controller = shortcut::controller::ShortcutController::new(
+        snapshot.public_key.clone(),
+        manager,
+        device.clone(),
+    );
+    let control_runtime = shortcut::base_control::start(
+        &interface_addresses,
+        &config.interface,
+        cancel.child_token(),
+    )
+    .await?;
+    let mut control_receiver = control_runtime.receiver;
+    let control_tasks = control_runtime.tasks;
+    let mut current_snapshot = snapshot.clone();
+    let mut next_issue = HashMap::<String, u64>::new();
+    let mut session_peers = HashMap::new();
+
     loop {
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => break,
+            control = control_receiver.recv() => {
+                let Some(control) = control else {
+                    std::future::pending::<()>().await;
+                    continue;
+                };
+                tracing::debug!(source = %control.source, "received shortcut control datagram");
+                if let shortcut::control::ControlMessage::Ticket { ticket } = control.message {
+                    let now = unix_now();
+                    let Some(sender) = current_snapshot.route_peer(control.source, None) else {
+                        tracing::debug!(source = %control.source, "shortcut control source is not an AllowedIP");
+                        continue;
+                    };
+                    if sender.latest_handshake == 0 || now.saturating_sub(sender.latest_handshake) > 180 {
+                        tracing::debug!(peer = %short(&sender.public_key), latest_handshake = sender.latest_handshake, now, "shortcut control base handshake is stale");
+                        continue;
+                    }
+                    let sender_key = sender.public_key.clone();
+                    match controller.receive_ticket(ticket, &sender_key, now, shortcut_outbound.clone()).await {
+                        Ok(session) => { session_peers.insert(session, sender_key); }
+                        Err(error) => debug_error("shortcut ticket rejected", &error),
+                    }
+                }
+            }
+            inbound = shortcut_inbound_receiver.recv() => {
+                let Some(inbound) = inbound else {
+                    std::future::pending::<()>().await;
+                    continue;
+                };
+                if let RelayChannel::ShortcutWireGuard { session } = inbound.channel
+                    && let Err(error) = device.receive(session, inbound.source_key, inbound.payload).await
+                {
+                    debug_error("shortcut packet rejected", &error);
+                }
+            }
+            event = events.recv() => {
+                let Some(event) = event else { break; };
+                let now = unix_now();
+                if controller.handle_device_event(&event, now)? {
+                    if let shortcut::device::DeviceEvent::AuthenticatedHandshake { session } = event {
+                        if let Some(peer) = session_peers.get(&session) {
+                            next_issue.insert(peer.clone(), now.saturating_add(120));
+                            info!(peer = %short(peer), ?session, "authenticated shortcut route activated");
+                        }
+                    }
+                }
+            }
             _ = sleep(config.poll_interval()) => {
                 let current = wireguard::snapshot(&config.interface)?;
                 for peer in &current.peers {
@@ -210,11 +304,48 @@ async fn run_generation_inner(
                         );
                     }
                 }
+                current_snapshot = current;
+                let now = unix_now();
+                for peer in &current_snapshot.peers {
+                    if snapshot.public_key >= peer.public_key
+                        || peer.latest_handshake == 0
+                        || now.saturating_sub(peer.latest_handshake) > 180
+                        || next_issue.get(&peer.public_key).is_some_and(|next| now < *next)
+                    {
+                        continue;
+                    }
+                    tracing::debug!(peer = %short(&peer.public_key), "attempting direct shortcut issue");
+                    match issue_direct_shortcut(
+                        &snapshot.public_key,
+                        &interface_addresses,
+                        peer,
+                        now,
+                        &mut controller,
+                        shortcut_outbound.clone(),
+                    ).await {
+                        Ok(session) => {
+                            session_peers.insert(session, peer.public_key.clone());
+                            next_issue.insert(peer.public_key.clone(), now.saturating_add(10));
+                        }
+                        Err(error) => debug_error("direct shortcut issue failed", &error),
+                    }
+                }
+                for session in controller.expire(now)? {
+                    device.remove(session).await?;
+                    session_peers.remove(&session);
+                }
             }
         }
     }
 
     cancel.cancel();
+    for session in controller.expire(u64::MAX)? {
+        let _ = device.remove(session).await;
+    }
+    let _ = device_task.await;
+    for task in control_tasks {
+        let _ = task.await;
+    }
     for task in broker_tasks {
         let _ = task.await;
     }
@@ -226,6 +357,78 @@ async fn run_generation_inner(
         }
     }
     Ok(())
+}
+
+async fn issue_direct_shortcut<R: shortcut::state::RouteManager>(
+    local_public_key: &str,
+    local_addresses: &[IpAddr],
+    peer: &wireguard::Peer,
+    now: u64,
+    controller: &mut shortcut::controller::ShortcutController<R>,
+    outbound: mpsc::Sender<broker::RelayPacket>,
+) -> Result<shortcut::state::SessionKey> {
+    let remote_address = peer
+        .allowed_ips
+        .iter()
+        .find_map(|network| {
+            ((network.addr().is_ipv4() && network.prefix_len() == 32)
+                || (network.addr().is_ipv6() && network.prefix_len() == 128))
+                .then_some(network.addr())
+        })
+        .ok_or_else(|| anyhow::anyhow!("peer has no host AllowedIP for in-band control"))?;
+    let local_address = local_addresses
+        .iter()
+        .copied()
+        .find(|address| address.is_ipv4() == remote_address.is_ipv4())
+        .ok_or_else(|| anyhow::anyhow!("no matching local WireGuard address family"))?;
+    let local = shortcut::cascade::CascadePeer {
+        public_key: local_public_key.to_string(),
+        peer_id: local_public_key.to_string(),
+        endpoint_candidates: vec![],
+    };
+    let remote = shortcut::cascade::CascadePeer {
+        public_key: peer.public_key.clone(),
+        peer_id: peer.public_key.clone(),
+        endpoint_candidates: vec![],
+    };
+    let pair = shortcut::cascade::plan(shortcut::cascade::CascadeRequest {
+        issuer_public_key: local_public_key,
+        upstream: &local,
+        downstream: &remote,
+        upstream_selector: host_selector(remote_address),
+        downstream_selector: host_selector(local_address),
+        parent: None,
+        now,
+    })?;
+    shortcut::base_control::send(
+        local_address,
+        remote_address,
+        &shortcut::control::ControlMessage::Ticket {
+            ticket: pair.downstream,
+        },
+    )
+    .await?;
+    controller
+        .receive_ticket(pair.upstream, local_public_key, now, outbound)
+        .await
+}
+
+fn host_selector(address: IpAddr) -> ipnet::IpNet {
+    match address {
+        IpAddr::V4(address) => ipnet::Ipv4Net::new(address, 32).unwrap().into(),
+        IpAddr::V6(address) => ipnet::Ipv6Net::new(address, 128).unwrap().into(),
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn debug_error(message: &str, error: &anyhow::Error) {
+    tracing::debug!(%error, "{message}");
 }
 
 fn short(key: &str) -> &str {

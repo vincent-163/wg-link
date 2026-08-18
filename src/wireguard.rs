@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
+use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, process::Command};
 
 #[derive(Debug, Clone)]
@@ -136,6 +137,37 @@ pub fn snapshot(interface: &str) -> Result<Snapshot> {
         listen_port,
         peers,
     })
+}
+
+#[derive(Deserialize)]
+struct AddressRecord {
+    addr_info: Vec<AddressInfo>,
+}
+
+#[derive(Deserialize)]
+struct AddressInfo {
+    local: IpAddr,
+    scope: String,
+}
+
+pub fn interface_addresses(interface: &str) -> Result<Vec<IpAddr>> {
+    let result = Command::new("ip")
+        .args(["-json", "address", "show", "dev", interface])
+        .output()
+        .with_context(|| format!("failed to read addresses for {interface}"))?;
+    if !result.status.success() {
+        bail!(
+            "ip address show {interface} failed: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        );
+    }
+    let records: Vec<AddressRecord> = serde_json::from_slice(&result.stdout)?;
+    Ok(records
+        .into_iter()
+        .flat_map(|record| record.addr_info)
+        .filter(|info| info.scope != "link" && !info.local.is_loopback())
+        .map(|info| info.local)
+        .collect())
 }
 
 #[cfg(test)]

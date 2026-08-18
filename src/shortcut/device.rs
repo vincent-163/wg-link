@@ -1,8 +1,11 @@
-use crate::shortcut::{
-    control::DerivedKeys,
-    engine::{ShortcutTunnel, TunnelOutput},
-    policy::UserspaceRoutes,
-    state::{RouteTarget, SessionKey},
+use crate::{
+    broker::{RelayChannel, RelayPacket},
+    shortcut::{
+        control::DerivedKeys,
+        engine::{ShortcutTunnel, TunnelOutput},
+        policy::UserspaceRoutes,
+        state::{RouteTarget, SessionKey},
+    },
 };
 use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
@@ -18,6 +21,7 @@ use tokio::{
 };
 use tokio_tun::Tun;
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 const DEFAULT_MTU: i32 = 1_380;
 const PACKET_BUFFER_SIZE: usize = 65_535;
@@ -50,13 +54,15 @@ impl DeviceHandle {
         &self,
         session: SessionKey,
         keys: DerivedKeys,
-        outbound: mpsc::Sender<Vec<u8>>,
+        remote_public_key: String,
+        outbound: mpsc::Sender<RelayPacket>,
     ) -> Result<()> {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(DeviceCommand::Prepare {
                 session,
                 keys,
+                remote_public_key,
                 outbound,
                 reply,
             })
@@ -70,13 +76,13 @@ impl DeviceHandle {
     pub async fn receive(
         &self,
         session: SessionKey,
-        source: Option<IpAddr>,
+        source_public_key: String,
         datagram: Vec<u8>,
     ) -> Result<()> {
         self.commands
             .send(DeviceCommand::Receive {
                 session,
-                source,
+                source_public_key,
                 datagram,
             })
             .await
@@ -168,12 +174,13 @@ enum DeviceCommand {
     Prepare {
         session: SessionKey,
         keys: DerivedKeys,
-        outbound: mpsc::Sender<Vec<u8>>,
+        remote_public_key: String,
+        outbound: mpsc::Sender<RelayPacket>,
         reply: oneshot::Sender<Result<()>>,
     },
     Receive {
         session: SessionKey,
-        source: Option<IpAddr>,
+        source_public_key: String,
         datagram: Vec<u8>,
     },
     Remove {
@@ -182,8 +189,10 @@ enum DeviceCommand {
 }
 
 struct SessionRuntime {
+    session: SessionKey,
     tunnel: ShortcutTunnel,
-    outbound: mpsc::Sender<Vec<u8>>,
+    remote_public_key: String,
+    outbound: mpsc::Sender<RelayPacket>,
 }
 
 async fn run(
@@ -214,20 +223,31 @@ async fn run(
                     .get_mut(&target.session)
                     .ok_or_else(|| anyhow!("active shortcut route points to a missing session"))?;
                 let output = runtime.tunnel.encapsulate(inner)?;
-                send_network(&runtime.outbound, output).await?;
+                send_network(runtime, output).await?;
             }
             command = commands.recv() => {
                 let Some(command) = command else { break; };
                 match command {
-                    DeviceCommand::Prepare { session, keys, outbound, reply } => {
-                        let result = prepare_session(session, keys, outbound, &mut sessions, &events).await;
+                    DeviceCommand::Prepare { session, keys, remote_public_key, outbound, reply } => {
+                        let result = prepare_session(session, keys, remote_public_key, outbound, &mut sessions, &events).await;
                         let _ = reply.send(result);
                     }
-                    DeviceCommand::Receive { session, source, datagram } => {
-                        let runtime = sessions
-                            .get_mut(&session)
-                            .ok_or_else(|| anyhow!("received datagram for unknown shortcut session"))?;
-                        let output = runtime.tunnel.receive(source, &datagram)?;
+                    DeviceCommand::Receive { session, source_public_key, datagram } => {
+                        let Some(runtime) = sessions.get_mut(&session) else {
+                            debug!(?session, "dropping shortcut datagram for unknown session");
+                            continue;
+                        };
+                        if runtime.remote_public_key != source_public_key {
+                            debug!(?session, "dropping shortcut datagram from unexpected peer");
+                            continue;
+                        }
+                        let output = match runtime.tunnel.receive(None, &datagram) {
+                            Ok(output) => output,
+                            Err(error) => {
+                                debug!(?session, %error, "dropping invalid shortcut datagram");
+                                continue;
+                            }
+                        };
                         if output.authenticated_handshake {
                             events.send(DeviceEvent::AuthenticatedHandshake { session }).await
                                 .context("shortcut event receiver stopped")?;
@@ -240,7 +260,7 @@ async fn run(
                             }
                             tun.send_all(&packet).await.context("failed writing shortcut TUN")?;
                         }
-                        send_packets(&runtime.outbound, network_packets).await?;
+                        send_packets(runtime, network_packets).await?;
                     }
                     DeviceCommand::Remove { session } => {
                         sessions.remove(&session);
@@ -250,7 +270,7 @@ async fn run(
             _ = timer.tick() => {
                 for runtime in sessions.values_mut() {
                     let output = runtime.tunnel.update_timers()?;
-                    send_network(&runtime.outbound, output).await?;
+                    send_network(runtime, output).await?;
                 }
             }
         }
@@ -261,16 +281,19 @@ async fn run(
 async fn prepare_session(
     session: SessionKey,
     keys: DerivedKeys,
-    outbound: mpsc::Sender<Vec<u8>>,
+    remote_public_key: String,
+    outbound: mpsc::Sender<RelayPacket>,
     sessions: &mut HashMap<SessionKey, SessionRuntime>,
     events: &mpsc::Sender<DeviceEvent>,
 ) -> Result<()> {
     let mut runtime = SessionRuntime {
+        session,
         tunnel: ShortcutTunnel::new(keys, session_index(session)),
+        remote_public_key,
         outbound,
     };
     let output = runtime.tunnel.encapsulate(&[])?;
-    send_network(&runtime.outbound, output).await?;
+    send_network(&runtime, output).await?;
     sessions.insert(session, runtime);
     events
         .send(DeviceEvent::HandshakeStarted { session })
@@ -279,14 +302,21 @@ async fn prepare_session(
     Ok(())
 }
 
-async fn send_network(outbound: &mpsc::Sender<Vec<u8>>, output: TunnelOutput) -> Result<()> {
-    send_packets(outbound, output.network_packets).await
+async fn send_network(runtime: &SessionRuntime, output: TunnelOutput) -> Result<()> {
+    send_packets(runtime, output.network_packets).await
 }
 
-async fn send_packets(outbound: &mpsc::Sender<Vec<u8>>, packets: Vec<Vec<u8>>) -> Result<()> {
+async fn send_packets(runtime: &SessionRuntime, packets: Vec<Vec<u8>>) -> Result<()> {
     for packet in packets {
-        outbound
-            .send(packet)
+        runtime
+            .outbound
+            .send(RelayPacket {
+                peer_key: runtime.remote_public_key.clone(),
+                channel: RelayChannel::ShortcutWireGuard {
+                    session: runtime.session,
+                },
+                payload: packet,
+            })
             .await
             .context("shortcut outer transport stopped")?;
     }

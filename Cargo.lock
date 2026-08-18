@@ -5087,6 +5087,7 @@ dependencies = [
  "futures-lite",
  "ipnet",
  "mainline",
+ "pnet",
  "rand 0.9.5",
  "reqwest",
  "serde",
