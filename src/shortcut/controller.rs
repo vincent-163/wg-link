@@ -40,9 +40,17 @@ impl<R: RouteManager> ShortcutController<R> {
             &self.local_public_key,
             now,
         )?;
-        self.device
+        if prepared.already_present {
+            return Ok(prepared.session);
+        }
+        if let Err(error) = self
+            .device
             .prepare(prepared.session, prepared.keys, remote_public_key, outbound)
-            .await?;
+            .await
+        {
+            self.manager.fail(prepared.session)?;
+            return Err(error);
+        }
         self.manager.mark_handshaking(prepared.session)?;
         Ok(prepared.session)
     }
@@ -54,11 +62,16 @@ impl<R: RouteManager> ShortcutController<R> {
             }
             DeviceEvent::HandshakeStarted { .. }
             | DeviceEvent::InnerPacket { .. }
-            | DeviceEvent::MissingRoute { .. } => Ok(false),
+            | DeviceEvent::MissingRoute { .. }
+            | DeviceEvent::SessionFailed { .. } => Ok(false),
         }
     }
 
     pub fn expire(&mut self, now: u64) -> Result<Vec<SessionKey>> {
         self.manager.expire(now)
+    }
+
+    pub fn fail(&mut self, session: SessionKey) -> Result<bool> {
+        self.manager.fail(session)
     }
 }

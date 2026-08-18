@@ -36,6 +36,7 @@ struct ManagedSession {
 pub struct PreparedShortcut {
     pub session: SessionKey,
     pub keys: DerivedKeys,
+    pub already_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +85,11 @@ impl<R: RouteManager> ShortcutManager<R> {
             {
                 bail!("conflicting shortcut ticket for an existing epoch");
             }
+            return Ok(PreparedShortcut {
+                session,
+                keys: existing.ticket.derive_keys(),
+                already_present: true,
+            });
         }
         let keys = ticket.derive_keys();
         self.sessions.insert(
@@ -93,7 +99,11 @@ impl<R: RouteManager> ShortcutManager<R> {
                 phase: SessionPhase::Prepared,
             },
         );
-        Ok(PreparedShortcut { session, keys })
+        Ok(PreparedShortcut {
+            session,
+            keys,
+            already_present: false,
+        })
     }
 
     pub fn mark_handshaking(&mut self, session: SessionKey) -> Result<()> {
@@ -156,6 +166,17 @@ impl<R: RouteManager> ShortcutManager<R> {
             self.sessions.remove(session);
         }
         Ok(expired)
+    }
+
+    pub fn fail(&mut self, session: SessionKey) -> Result<bool> {
+        let Some(managed) = self.sessions.remove(&session) else {
+            return Ok(false);
+        };
+        if self.active_routes.get(&managed.ticket.selector) == Some(&session) {
+            self.routes.deactivate(managed.ticket.selector)?;
+            self.active_routes.remove(&managed.ticket.selector);
+        }
+        Ok(true)
     }
 
     pub fn phase(&self, session: SessionKey) -> Option<SessionPhase> {
@@ -266,6 +287,61 @@ mod tests {
             .unwrap();
         assert_eq!(manager.routes().activations.len(), 2);
         assert_eq!(manager.phase(first.session), Some(SessionPhase::Draining));
+        assert_eq!(manager.phase(second.session), Some(SessionPhase::Active));
+    }
+
+    #[test]
+    fn duplicate_ticket_does_not_reset_active_session() {
+        let mut manager = ShortcutManager::new(MockRoutes::default());
+        let first = manager
+            .receive_ticket(ticket(1), "issuer", "recipient", 1_001)
+            .unwrap();
+        manager
+            .authenticated_handshake(first.session, 1_002)
+            .unwrap();
+
+        let duplicate = manager
+            .receive_ticket(ticket(1), "issuer", "recipient", 1_003)
+            .unwrap();
+
+        assert!(duplicate.already_present);
+        assert_eq!(manager.phase(first.session), Some(SessionPhase::Active));
+        assert_eq!(manager.routes().activations.len(), 1);
+    }
+
+    #[test]
+    fn failing_active_session_removes_its_route() {
+        let mut manager = ShortcutManager::new(MockRoutes::default());
+        let prepared = manager
+            .receive_ticket(ticket(1), "issuer", "recipient", 1_001)
+            .unwrap();
+        manager
+            .authenticated_handshake(prepared.session, 1_002)
+            .unwrap();
+
+        assert!(manager.fail(prepared.session).unwrap());
+        assert_eq!(manager.routes().deactivations.len(), 1);
+        assert_eq!(manager.phase(prepared.session), None);
+    }
+
+    #[test]
+    fn failing_old_session_keeps_new_active_route() {
+        let mut manager = ShortcutManager::new(MockRoutes::default());
+        let first = manager
+            .receive_ticket(ticket(1), "issuer", "recipient", 1_001)
+            .unwrap();
+        manager
+            .authenticated_handshake(first.session, 1_002)
+            .unwrap();
+        let second = manager
+            .receive_ticket(ticket(2), "issuer", "recipient", 1_003)
+            .unwrap();
+        manager
+            .authenticated_handshake(second.session, 1_004)
+            .unwrap();
+
+        assert!(manager.fail(first.session).unwrap());
+        assert!(manager.routes().deactivations.is_empty());
         assert_eq!(manager.phase(second.session), Some(SessionPhase::Active));
     }
 

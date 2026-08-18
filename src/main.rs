@@ -12,11 +12,12 @@ use anyhow::Result;
 use broker::{PathSet, PathTarget, RelayChannel};
 use clap::Parser;
 use config::Config;
+use shortcut::renewal::{IssueKey, RenewalScheduler};
 use std::{
     collections::HashMap,
     net::IpAddr,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{RwLock, mpsc},
@@ -131,7 +132,12 @@ async fn run_generation(
     management: management::ManagementState,
     cancel: CancellationToken,
 ) {
-    if let Err(error) = run_generation_inner(config, snapshot, management, cancel).await {
+    let generation_cancel = cancel.child_token();
+    let result =
+        run_generation_inner(config, snapshot, management, generation_cancel.clone()).await;
+    generation_cancel.cancel();
+    sleep(Duration::from_millis(1_200)).await;
+    if let Err(error) = result {
         error!(%error, "wg-link generation failed");
     }
 }
@@ -244,6 +250,16 @@ async fn run_generation_inner(
         )
         .await;
 
+    let policy = shortcut::policy::SystemPolicy::new_with_source(
+        SHORTCUT_TUN,
+        interface_addresses
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("missing local WireGuard source address"))?,
+    );
+    policy.cleanup_stale()?;
+    policy.ensure_control_bypass()?;
+
     let (shortcut_outbound, shortcut_dispatch_receiver) = mpsc::channel(256);
     let shortcut_dispatch_task = tokio::spawn(broker::run_dispatcher(
         path_maps.clone(),
@@ -258,16 +274,7 @@ async fn run_generation_inner(
         mut events,
         task: device_task,
     } = device_runtime;
-    let route_manager = shortcut::policy::AtomicRouteManager::new(
-        routes,
-        shortcut::policy::SystemPolicy::new_with_source(
-            SHORTCUT_TUN,
-            interface_addresses
-                .first()
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("missing local WireGuard source address"))?,
-        ),
-    );
+    let route_manager = shortcut::policy::AtomicRouteManager::new(routes, policy);
     let manager = shortcut::state::ShortcutManager::new(route_manager);
     let mut controller = shortcut::controller::ShortcutController::new(
         snapshot.public_key.clone(),
@@ -283,60 +290,15 @@ async fn run_generation_inner(
     let mut control_receiver = control_runtime.receiver;
     let control_tasks = control_runtime.tasks;
     let mut current_snapshot = snapshot.clone();
-    let mut next_issue = HashMap::<String, u64>::new();
-    let mut session_peers = HashMap::new();
+    let mut renewals = RenewalScheduler::default();
+    let mut poll = tokio::time::interval(config.poll_interval());
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            control = control_receiver.recv() => {
-                let Some(control) = control else {
-                    std::future::pending::<()>().await;
-                    continue;
-                };
-                tracing::debug!(source = %control.source, "received shortcut control datagram");
-                if let shortcut::control::ControlMessage::Ticket { ticket } = control.message {
-                    let now = unix_now();
-                    let Some(sender) = current_snapshot.route_peer(control.source, None) else {
-                        tracing::debug!(source = %control.source, "shortcut control source is not an AllowedIP");
-                        continue;
-                    };
-                    if sender.latest_handshake == 0 || now.saturating_sub(sender.latest_handshake) > 180 {
-                        tracing::debug!(peer = %short(&sender.public_key), latest_handshake = sender.latest_handshake, now, "shortcut control base handshake is stale");
-                        continue;
-                    }
-                    let sender_key = sender.public_key.clone();
-                    match controller.receive_ticket(ticket, &sender_key, now, shortcut_outbound.clone()).await {
-                        Ok(session) => { session_peers.insert(session, sender_key); }
-                        Err(error) => debug_error("shortcut ticket rejected", &error),
-                    }
-                }
-            }
-            inbound = shortcut_inbound_receiver.recv() => {
-                let Some(inbound) = inbound else {
-                    std::future::pending::<()>().await;
-                    continue;
-                };
-                if let RelayChannel::ShortcutWireGuard { session } = inbound.channel
-                    && let Err(error) = device.receive(session, inbound.source_key, inbound.payload).await
-                {
-                    debug_error("shortcut packet rejected", &error);
-                }
-            }
-            event = events.recv() => {
-                let Some(event) = event else { break; };
-                let now = unix_now();
-                if controller.handle_device_event(&event, now)? {
-                    if let shortcut::device::DeviceEvent::AuthenticatedHandshake { session } = event {
-                        if let Some(peer) = session_peers.get(&session) {
-                            next_issue.insert(peer.clone(), now.saturating_add(120));
-                            info!(peer = %short(peer), ?session, "authenticated shortcut route activated");
-                        }
-                    }
-                }
-            }
-            _ = sleep(config.poll_interval()) => {
+            _ = poll.tick() => {
                 let current = wireguard::snapshot(&config.interface)?;
                 for peer in &current.peers {
                     let Some(port) = managed_ports.get(&peer.public_key) else { continue; };
@@ -358,10 +320,7 @@ async fn run_generation_inner(
                 let now = unix_now();
                 let local_is_hub = current_snapshot.peers.len() > 1;
                 for peer in &current_snapshot.peers {
-                    if peer.latest_handshake == 0
-                        || now.saturating_sub(peer.latest_handshake) > 180
-                        || next_issue.get(&peer.public_key).is_some_and(|next| now < *next)
-                    {
+                    if peer.latest_handshake == 0 || !local_is_hub {
                         continue;
                     }
                     let Some(remote_address) = host_allowed_address(peer) else {
@@ -374,21 +333,35 @@ async fn run_generation_inner(
                     else {
                         continue;
                     };
-                    let remote_selectors = if local_is_hub {
-                        current_snapshot
-                            .peers
-                            .iter()
-                            .filter(|other| other.public_key != peer.public_key)
-                            .filter_map(host_allowed_address)
-                            .filter(|address| address.is_ipv4() == remote_address.is_ipv4())
-                            .collect::<Vec<_>>()
-                    } else if snapshot.public_key < peer.public_key {
-                        vec![local_address]
-                    } else {
-                        Vec::new()
-                    };
-                    let mut issued = false;
+                    let remote_selectors = current_snapshot
+                        .peers
+                        .iter()
+                        .filter(|other| other.public_key != peer.public_key)
+                        .filter_map(host_allowed_address)
+                        .filter(|address| address.is_ipv4() == remote_address.is_ipv4())
+                        .collect::<Vec<_>>();
                     for remote_selector in remote_selectors {
+                        let issue = IssueKey {
+                            peer_public_key: peer.public_key.clone(),
+                            downstream_selector: host_selector(remote_selector),
+                        };
+                        if now.saturating_sub(peer.latest_handshake) > 180
+                            && !renewals.has_active(&issue)
+                        {
+                            continue;
+                        }
+                        let Some(attempt) = renewals.begin_issue(&issue, now) else {
+                            continue;
+                        };
+                        if let Some(session) = attempt.stale_pending {
+                            if let Err(error) = controller.fail(session) {
+                                debug_error("failed to discard timed out shortcut session", &error);
+                            }
+                            if let Err(error) = device.remove(session).await {
+                                debug_error("failed to remove timed out shortcut device session", &error);
+                            }
+                            renewals.removed(session, now);
+                        }
                         tracing::debug!(
                             peer = %short(&peer.public_key),
                             selector = %remote_selector,
@@ -406,20 +379,93 @@ async fn run_generation_inner(
                             &mut controller,
                             shortcut_outbound.clone(),
                         ).await {
-                            Ok(session) => {
-                                session_peers.insert(session, peer.public_key.clone());
-                                issued = true;
+                            Ok(issued) => {
+                                renewals.issued(issue, issued.session, issued.renew_at, now);
                             }
                             Err(error) => debug_error("shortcut issue failed", &error),
                         }
                     }
-                    if issued {
-                        next_issue.insert(peer.public_key.clone(), now.saturating_add(10));
-                    }
                 }
                 for session in controller.expire(now)? {
                     device.remove(session).await?;
-                    session_peers.remove(&session);
+                    renewals.removed(session, now);
+                }
+            }
+            control = control_receiver.recv() => {
+                let Some(control) = control else {
+                    std::future::pending::<()>().await;
+                    continue;
+                };
+                tracing::debug!(source = %control.source, "received shortcut control datagram");
+                if let shortcut::control::ControlMessage::Ticket { ticket } = control.message {
+                    let now = unix_now();
+                    let Some(sender) = current_snapshot.route_peer(control.source, None) else {
+                        tracing::debug!(source = %control.source, "shortcut control source is not an AllowedIP");
+                        continue;
+                    };
+                    if sender.latest_handshake == 0 || now.saturating_sub(sender.latest_handshake) > 180 {
+                        tracing::debug!(peer = %short(&sender.public_key), latest_handshake = sender.latest_handshake, now, "shortcut control base handshake is stale");
+                        continue;
+                    }
+                    let sender_key = sender.public_key.clone();
+                    match controller.receive_ticket(ticket, &sender_key, now, shortcut_outbound.clone()).await {
+                        Ok(_) => {}
+                        Err(error) => debug_error("shortcut ticket rejected", &error),
+                    }
+                }
+            }
+            inbound = shortcut_inbound_receiver.recv() => {
+                let Some(inbound) = inbound else {
+                    std::future::pending::<()>().await;
+                    continue;
+                };
+                if let RelayChannel::ShortcutWireGuard { session } = inbound.channel
+                    && let Err(error) = device.receive(session, inbound.source_key, inbound.payload).await
+                {
+                    debug_error("shortcut packet rejected", &error);
+                }
+            }
+            event = events.recv() => {
+                let Some(event) = event else { break; };
+                let now = unix_now();
+                if let shortcut::device::DeviceEvent::SessionFailed { session } = event {
+                    match controller.fail(session) {
+                        Ok(true) => {
+                            renewals.removed(session, now);
+                            info!(?session, "removed failed shortcut session");
+                        }
+                        Ok(false) => {}
+                        Err(error) => debug_error("failed to remove shortcut session", &error),
+                    }
+                    continue;
+                }
+                let authenticated_session = match event {
+                    shortcut::device::DeviceEvent::AuthenticatedHandshake { session } => Some(session),
+                    _ => None,
+                };
+                match controller.handle_device_event(&event, now) {
+                    Ok(true) => {
+                        if let Some(session) = authenticated_session {
+                            if let Some(next_issue) = renewals.authenticated(session, now) {
+                                info!(?session, next_issue, "authenticated locally issued shortcut route");
+                            } else {
+                                info!(?session, "authenticated received shortcut route");
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        debug_error("shortcut device event rejected", &error);
+                        if let Some(session) = authenticated_session {
+                            if let Err(remove_error) = controller.fail(session) {
+                                debug_error("failed to discard rejected shortcut session", &remove_error);
+                            }
+                            if let Err(remove_error) = device.remove(session).await {
+                                debug_error("failed to remove rejected shortcut device session", &remove_error);
+                            }
+                            renewals.removed(session, now);
+                        }
+                    }
                 }
             }
         }
@@ -429,7 +475,11 @@ async fn run_generation_inner(
     for session in controller.expire(u64::MAX)? {
         let _ = device.remove(session).await;
     }
-    let _ = device_task.await;
+    match device_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "shortcut device stopped with error"),
+        Err(error) => warn!(%error, "shortcut device task failed"),
+    }
     for task in control_tasks {
         let _ = task.await;
     }
@@ -461,7 +511,7 @@ async fn issue_shortcut<R: shortcut::state::RouteManager>(
     now: u64,
     controller: &mut shortcut::controller::ShortcutController<R>,
     outbound: mpsc::Sender<broker::RelayPacket>,
-) -> Result<shortcut::state::SessionKey> {
+) -> Result<IssuedShortcut> {
     let local = shortcut::cascade::CascadePeer {
         public_key: local_public_key.to_string(),
         peer_id: local_public_key.to_string(),
@@ -481,6 +531,7 @@ async fn issue_shortcut<R: shortcut::state::RouteManager>(
         parent: None,
         now,
     })?;
+    let renew_at = pair.upstream.renew_at;
     shortcut::base_control::send(
         local_address,
         remote_address,
@@ -489,9 +540,15 @@ async fn issue_shortcut<R: shortcut::state::RouteManager>(
         },
     )
     .await?;
-    controller
+    let session = controller
         .receive_ticket(pair.upstream, local_public_key, now, outbound)
-        .await
+        .await?;
+    Ok(IssuedShortcut { session, renew_at })
+}
+
+struct IssuedShortcut {
+    session: shortcut::state::SessionKey,
+    renew_at: u64,
 }
 
 fn host_allowed_address(peer: &wireguard::Peer) -> Option<IpAddr> {

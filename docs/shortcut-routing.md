@@ -260,6 +260,11 @@ Outer UDP sockets for EasyTier, STUN, trackers, and direct shortcut endpoints
 receive a dedicated firewall mark. A higher-priority rule sends that mark to
 the main routing table so encrypted outer traffic never re-enters `wgls0`.
 
+The in-band control socket has its own dedicated mark and uses the same
+higher-priority main-table bypass. CREATE and renewal tickets therefore keep
+traversing the authenticated base WireGuard path even while their destination
+has an active shortcut selector. Reverse-path filtering remains enabled.
+
 The userspace engine reads original IP packets from `wgls0`, selects the
 shortcut peer with its own longest-prefix table, encrypts them, and sends the
 result through the best outer transport. Decrypted packets are written back to
@@ -275,17 +280,18 @@ Shortcut authority follows WireGuard's handshake timing model:
 
 - `renew-after`: 120 seconds;
 - `expires-at`: 180 seconds after the ticket epoch begins;
-- overlap between old and new epochs: up to 30 seconds.
+- replacement preparation lead: 90 seconds before `renew-after`.
 
-At renewal time, `A` sends a new one-way `RENEW` ticket with a fresh master
-secret and epoch to `L` and `B` through their base WireGuard paths. Sending the
-renewal itself keeps the base path active and triggers normal WireGuard rekeying
-when needed.
+Ninety seconds before renewal time, `A` sends a new one-way `RENEW` ticket with
+a fresh master secret and epoch to `L` and `B` through their base WireGuard
+paths. Sending the renewal itself keeps the base path active and triggers
+normal WireGuard rekeying when needed.
 
 Each endpoint prepares the new ephemeral shortcut session beside the old one.
 After the new handshake succeeds, it atomically replaces the userspace route
-entry while the policy rule remains installed. The old epoch is destroyed at
-the end of the overlap window.
+entry while the policy rule remains installed. The old epoch remains available
+until its lease expires, so a failed replacement can be retried without
+withdrawing the active policy route.
 
 No acknowledgement RTT is required. If one side misses renewal, its current
 epoch expires at 180 seconds. Loss of direct authenticated handshakes, repeated

@@ -5,6 +5,7 @@ pub mod controller;
 pub mod device;
 pub mod engine;
 pub mod policy;
+pub mod renewal;
 pub mod state;
 pub mod transit;
 

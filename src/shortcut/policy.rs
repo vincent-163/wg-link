@@ -1,14 +1,20 @@
-use crate::shortcut::state::{RouteManager, RouteTarget};
+use crate::shortcut::{
+    base_control::CONTROL_SOCKET_MARK,
+    state::{RouteManager, RouteTarget},
+};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use std::{
     collections::HashMap,
     net::IpAddr,
+    ops::Range,
     process::{Command, Output},
 };
 
 pub const DEFAULT_TABLE: u32 = 51_820;
 pub const DEFAULT_RULE_PRIORITY_BASE: u32 = 11_000;
+const CONTROL_RULE_PRIORITY: u32 = 10_500;
+const MANAGED_RULE_PRIORITY_RANGE: Range<u32> = 11_000..21_000;
 
 pub trait UserspaceRoutes {
     fn replace(&mut self, selector: IpNet, target: RouteTarget) -> Result<()>;
@@ -83,6 +89,103 @@ impl SystemPolicy {
             priority_base: DEFAULT_RULE_PRIORITY_BASE,
             source: Some(source),
         }
+    }
+
+    pub fn cleanup_stale(&self) -> Result<()> {
+        self.remove_control_bypass()?;
+        for family in ["-4", "-6"] {
+            let output = ip_output([family, "rule", "show"])?;
+            if !output.status.success() {
+                bail!(
+                    "ip {family} rule show failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            for priority in String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    parse_managed_rule(line, self.table, &MANAGED_RULE_PRIORITY_RANGE)
+                })
+            {
+                let priority = priority.to_string();
+                let table = self.table.to_string();
+                run_ip([
+                    family,
+                    "rule",
+                    "del",
+                    "priority",
+                    priority.as_str(),
+                    "lookup",
+                    table.as_str(),
+                ])?;
+            }
+            let table = self.table.to_string();
+            let output = ip_output([family, "route", "flush", "table", table.as_str()])?;
+            if !output.status.success()
+                && !String::from_utf8_lossy(&output.stderr).contains("FIB table does not exist")
+            {
+                bail!(
+                    "ip {family} route flush failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ensure_control_bypass(&self) -> Result<()> {
+        for family in ["-4", "-6"] {
+            let priority = CONTROL_RULE_PRIORITY.to_string();
+            let mark = format!("0x{CONTROL_SOCKET_MARK:x}/0xffff");
+            let output = ip_output([
+                family,
+                "rule",
+                "add",
+                "priority",
+                priority.as_str(),
+                "fwmark",
+                mark.as_str(),
+                "lookup",
+                "main",
+            ])?;
+            if !output.status.success()
+                && !String::from_utf8_lossy(&output.stderr).contains("File exists")
+            {
+                bail!(
+                    "ip {family} control bypass rule add failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_control_bypass(&self) -> Result<()> {
+        for family in ["-4", "-6"] {
+            let priority = CONTROL_RULE_PRIORITY.to_string();
+            let mark = format!("0x{CONTROL_SOCKET_MARK:x}/0xffff");
+            let output = ip_output([
+                family,
+                "rule",
+                "del",
+                "priority",
+                priority.as_str(),
+                "fwmark",
+                mark.as_str(),
+                "lookup",
+                "main",
+            ])?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("No such file") && !stderr.contains("No such process") {
+                    bail!(
+                        "ip {family} control bypass rule removal failed: {}",
+                        stderr.trim()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn prepare(&self, selector: IpNet) -> Result<()> {
@@ -189,6 +292,19 @@ fn ip_output(arguments: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -
         .args(arguments)
         .output()
         .context("failed to run ip")
+}
+
+fn parse_managed_rule(line: &str, table: u32, priority_range: &Range<u32>) -> Option<u32> {
+    let mut fields = line.split_whitespace();
+    let priority = fields.next()?.trim_end_matches(':').parse().ok()?;
+    if !priority_range.contains(&priority) {
+        return None;
+    }
+    let lookup = fields
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|pair| (pair[0] == "lookup").then_some(pair[1]))?;
+    (lookup == table.to_string()).then_some(priority)
 }
 
 #[cfg(test)]
@@ -307,6 +423,31 @@ mod tests {
                 "policy:remove:198.51.100.7/32",
                 "userspace:remove:198.51.100.7/32"
             ]
+        );
+    }
+
+    #[test]
+    fn parses_only_managed_rules_for_dedicated_table() {
+        let range = 11_000..21_000;
+        assert_eq!(
+            parse_managed_rule(
+                "11042: from all to 192.168.38.2 lookup 51820",
+                51_820,
+                &range
+            ),
+            Some(11_042)
+        );
+        assert_eq!(
+            parse_managed_rule("100: from all lookup 51820", 51_820, &range),
+            None
+        );
+        assert_eq!(
+            parse_managed_rule("11042: from all lookup main", 51_820, &range),
+            None
+        );
+        assert_eq!(
+            parse_managed_rule("11042: from all lookup 51821", 51_820, &range),
+            None
         );
     }
 }

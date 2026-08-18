@@ -1,6 +1,7 @@
 use crate::shortcut::control::ControlMessage;
 use anyhow::{Context, Result, bail};
 use pnet::datalink::{self, Channel, Config as DataLinkConfig};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
@@ -8,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 pub const CONTROL_PORT: u16 = 51_821;
+pub const CONTROL_SOCKET_MARK: u32 = 0x5747;
 
 pub struct ReceivedControl {
     pub source: IpAddr,
@@ -153,7 +155,16 @@ pub async fn send(local: IpAddr, target: IpAddr, message: &ControlMessage) -> Re
     if local.is_ipv4() != target.is_ipv4() {
         bail!("shortcut control address families do not match");
     }
-    let socket = UdpSocket::bind(SocketAddr::new(local, 0)).await?;
+    let domain = if local.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_mark(CONTROL_SOCKET_MARK)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SockAddr::from(SocketAddr::new(local, 0)))?;
+    let socket = UdpSocket::from_std(socket.into())?;
     if local.is_ipv4() {
         socket.set_ttl(1)?;
     }

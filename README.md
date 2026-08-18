@@ -99,7 +99,7 @@ Run as root or with the capabilities required to call `wg set`:
 ```bash
 RUST_LOG=wg_linkd=info ./target/release/wg-linkd \
   --interface wg-link0 \
-  --relay tcp://relay.example.com:11010
+  --relay tcp://relay.example.com:11020
 ```
 
 Optional discovery:
@@ -107,7 +107,7 @@ Optional discovery:
 ```bash
 ./target/release/wg-linkd \
   --interface wg-link0 \
-  --relay tcp://relay.example.com:11010 \
+  --relay tcp://relay.example.com:11020 \
   --dht \
   --http-tracker https://tracker.example/announce \
   --udp-tracker udp://tracker.example:6969/announce
@@ -130,3 +130,9 @@ paths, and a separate non-persistent TUN backed by an in-process userspace
 WireGuard engine. The main interface and its `AllowedIPs` remain unchanged;
 active destinations enter a dedicated policy table whose default device is the
 shortcut TUN.
+
+Shortcut control datagrams carry a dedicated socket mark. A higher-priority
+policy rule sends that mark through the main routing table, so renewals always
+traverse the authenticated base WireGuard path even while the destination has
+an active `wgls0` shortcut. This does not require weakening reverse-path
+filtering.

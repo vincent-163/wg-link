@@ -42,6 +42,9 @@ pub enum DeviceEvent {
     MissingRoute {
         destination: IpAddr,
     },
+    SessionFailed {
+        session: SessionKey,
+    },
 }
 
 #[derive(Clone)]
@@ -219,11 +222,22 @@ async fn run(
                     let _ = events.send(DeviceEvent::MissingRoute { destination }).await;
                     continue;
                 };
-                let runtime = sessions
-                    .get_mut(&target.session)
-                    .ok_or_else(|| anyhow!("active shortcut route points to a missing session"))?;
-                let output = runtime.tunnel.encapsulate(inner)?;
-                send_network(runtime, output).await?;
+                let result = if let Some(runtime) = sessions.get_mut(&target.session) {
+                    runtime.tunnel.encapsulate(inner)
+                } else {
+                    debug!(session = ?target.session, "dropping packet for missing shortcut session");
+                    continue;
+                };
+                let result = match result {
+                    Ok(output) => match sessions.get(&target.session) {
+                        Some(runtime) => send_network(runtime, output).await,
+                        None => Ok(()),
+                    },
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    fail_session(target.session, error, &mut sessions, &events).await?;
+                }
             }
             command = commands.recv() => {
                 let Some(command) = command else { break; };
@@ -260,7 +274,9 @@ async fn run(
                             }
                             tun.send_all(&packet).await.context("failed writing shortcut TUN")?;
                         }
-                        send_packets(runtime, network_packets).await?;
+                        if let Err(error) = send_packets(runtime, network_packets).await {
+                            fail_session(session, error, &mut sessions, &events).await?;
+                        }
                     }
                     DeviceCommand::Remove { session } => {
                         sessions.remove(&session);
@@ -268,14 +284,42 @@ async fn run(
                 }
             }
             _ = timer.tick() => {
-                for runtime in sessions.values_mut() {
-                    let output = runtime.tunnel.update_timers()?;
-                    send_network(runtime, output).await?;
+                let session_keys = sessions.keys().copied().collect::<Vec<_>>();
+                for session in session_keys {
+                    let result = if let Some(runtime) = sessions.get_mut(&session) {
+                        runtime.tunnel.update_timers()
+                    } else {
+                        continue;
+                    };
+                    let result = match result {
+                        Ok(output) => match sessions.get(&session) {
+                            Some(runtime) => send_network(runtime, output).await,
+                            None => Ok(()),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        fail_session(session, error, &mut sessions, &events).await?;
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+async fn fail_session(
+    session: SessionKey,
+    error: anyhow::Error,
+    sessions: &mut HashMap<SessionKey, SessionRuntime>,
+    events: &mpsc::Sender<DeviceEvent>,
+) -> Result<()> {
+    debug!(?session, %error, "shortcut session failed; removing only this session");
+    sessions.remove(&session);
+    events
+        .send(DeviceEvent::SessionFailed { session })
+        .await
+        .context("shortcut event receiver stopped")
 }
 
 async fn prepare_session(
