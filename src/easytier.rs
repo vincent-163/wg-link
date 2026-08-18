@@ -511,8 +511,10 @@ fn build_config(
     candidates: &[SocketAddr],
 ) -> String {
     let node_name = identity::rotating_node_name(&spec.local_public_key, peer_id_period);
+    let instance_id = identity::rotating_instance_id(&spec.local_public_key, peer_id_period);
     let mut text = format!(
-        "instance_name = {}\nhostname = {}\ndhcp = false\nlisteners = [{}]\nstun_servers = [{}]\n\n[network_identity]\nnetwork_name = {}\nnetwork_secret = \"\"\n\n",
+        "instance_id = {}\ninstance_name = {}\nhostname = {}\ndhcp = false\nlisteners = [{}]\nstun_servers = [{}]\n\n[network_identity]\nnetwork_name = {}\nnetwork_secret = \"\"\n\n",
+        toml_string(&instance_id),
         toml_string(&node_name),
         toml_string(&node_name),
         toml_string(&format!("udp://0.0.0.0:{}", spec.listener_port)),

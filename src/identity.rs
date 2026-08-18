@@ -41,6 +41,25 @@ pub fn rotating_node_name(public_key: &str, period: u64) -> String {
     format!("wgl-{}", rotating_node_id(public_key, period))
 }
 
+pub fn rotating_instance_id(public_key: &str, period: u64) -> String {
+    let period = period.to_be_bytes();
+    let hex = digest(&[
+        b"wg-link/hourly-instance/v1",
+        public_key.as_bytes(),
+        &period,
+    ])
+    .to_hex()
+    .to_string();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 pub fn transport_network() -> String {
     let hash = digest(&[b"wg-link/easytier-network/v2"]);
     format!("wglr-{}", &hash.to_hex()[..20])
@@ -82,6 +101,14 @@ mod tests {
         assert_ne!(first, rotating_node_id("wg-public-key", 11));
         assert_ne!(first, rotating_node_id("other-key", 10));
         assert_eq!(first, rotating_node_id("wg-public-key", 10));
+    }
+
+    #[test]
+    fn rotating_instance_ids_are_stable_per_node_and_hour() {
+        let first = rotating_instance_id("wg-public-key", 10);
+        assert_eq!(first, rotating_instance_id("wg-public-key", 10));
+        assert_ne!(first, rotating_instance_id("wg-public-key", 11));
+        assert_ne!(first, rotating_instance_id("other-key", 10));
     }
 
     #[test]

@@ -235,7 +235,17 @@ impl PeerManager {
         global_ctx: ArcGlobalCtx,
         nic_channel: PacketRecvChan,
     ) -> Self {
-        let my_peer_id = rand::random();
+        let instance_id = global_ctx.get_id();
+        let instance_bytes = instance_id.as_bytes();
+        let my_peer_id = match u32::from_be_bytes([
+            instance_bytes[0],
+            instance_bytes[1],
+            instance_bytes[2],
+            instance_bytes[3],
+        ]) {
+            0 => 1,
+            peer_id => peer_id,
+        };
 
         let (packet_send, packet_recv) = create_packet_recv_chan();
         let peers = Arc::new(PeerMap::new(

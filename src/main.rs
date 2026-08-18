@@ -325,7 +325,14 @@ async fn run_generation_inner(
                 }
             }
             event = events.recv() => {
-                let Some(event) = event else { break; };
+                let Some(event) = event else {
+                    if device_task.is_finished() {
+                        warn!("shortcut device task stopped; restarting generation");
+                    } else {
+                        warn!("shortcut device event channel closed; restarting generation");
+                    }
+                    break;
+                };
                 let now = unix_now();
                 if controller.handle_device_event(&event, now)? {
                     if let shortcut::device::DeviceEvent::AuthenticatedHandshake { session } = event {
