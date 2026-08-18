@@ -92,3 +92,11 @@ added to EasyTier at runtime; restarting `wg-linkd` is not required.
 The daemon deliberately does not create WireGuard interfaces, assign tunnel
 addresses, install routes, or persist keys. Those remain owned by the system's
 normal WireGuard configuration.
+
+## Shortcut routing design
+
+The proposed route-delegation protocol for replacing an authenticated
+two-hop WireGuard path with a direct peer relationship is documented in
+[`docs/shortcut-routing.md`](docs/shortcut-routing.md). The safe kernel mode is
+limited to strictly more-specific shortcut prefixes; equal-prefix takeover
+requires a custom userspace route selector or persistent recovery state.
