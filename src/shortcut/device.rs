@@ -21,7 +21,7 @@ use tokio::{
 };
 use tokio_tun::Tun;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::debug;
 
 const DEFAULT_MTU: i32 = 1_380;
 const PACKET_BUFFER_SIZE: usize = 65_535;
@@ -149,7 +149,6 @@ pub fn start(name: &str, cancel: CancellationToken) -> Result<DeviceRuntime> {
     let tun = devices
         .pop()
         .ok_or_else(|| anyhow!("shortcut TUN builder returned no device"))?;
-    configure_shortcut_sysctls(name)?;
     let routes = DeviceRoutes::default();
     let (command_sender, command_receiver) = mpsc::channel(256);
     let (event_sender, event_receiver) = mpsc::channel(256);
@@ -220,20 +219,11 @@ async fn run(
                     let _ = events.send(DeviceEvent::MissingRoute { destination }).await;
                     continue;
                 };
-                let Some(runtime) = sessions.get_mut(&target.session) else {
-                    let _ = events.send(DeviceEvent::MissingRoute { destination }).await;
-                    continue;
-                };
-                let output = match runtime.tunnel.encapsulate(inner) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        warn!(?target.session, %error, "failed to encapsulate shortcut packet");
-                        continue;
-                    }
-                };
-                if let Err(error) = send_network(runtime, output).await {
-                    warn!(?target.session, %error, "failed to send shortcut packet");
-                }
+                let runtime = sessions
+                    .get_mut(&target.session)
+                    .ok_or_else(|| anyhow!("active shortcut route points to a missing session"))?;
+                let output = runtime.tunnel.encapsulate(inner)?;
+                send_network(runtime, output).await?;
             }
             command = commands.recv() => {
                 let Some(command) = command else { break; };
@@ -270,9 +260,7 @@ async fn run(
                             }
                             tun.send_all(&packet).await.context("failed writing shortcut TUN")?;
                         }
-                        if let Err(error) = send_packets(runtime, network_packets).await {
-                            warn!(?session, %error, "failed to send shortcut packets");
-                        }
+                        send_packets(runtime, network_packets).await?;
                     }
                     DeviceCommand::Remove { session } => {
                         sessions.remove(&session);
@@ -281,30 +269,11 @@ async fn run(
             }
             _ = timer.tick() => {
                 for runtime in sessions.values_mut() {
-                    let output = match runtime.tunnel.update_timers() {
-                        Ok(output) => output,
-                        Err(error) => {
-                            warn!(session = ?runtime.session, %error, "shortcut session timer update failed");
-                            continue;
-                        }
-                    };
-                    if let Err(error) = send_network(runtime, output).await {
-                        warn!(session = ?runtime.session, %error, "failed to send shortcut timer packets");
-                    }
+                    let output = runtime.tunnel.update_timers()?;
+                    send_network(runtime, output).await?;
                 }
             }
         }
-    }
-    Ok(())
-}
-
-fn configure_shortcut_sysctls(name: &str) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", b"0\n")
-            .context("failed to disable IPv4 rp_filter globally for shortcut routing")?;
-        std::fs::write(format!("/proc/sys/net/ipv4/conf/{name}/rp_filter"), b"0\n")
-            .with_context(|| format!("failed to disable IPv4 rp_filter on shortcut TUN {name}"))?;
     }
     Ok(())
 }

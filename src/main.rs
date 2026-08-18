@@ -325,14 +325,7 @@ async fn run_generation_inner(
                 }
             }
             event = events.recv() => {
-                let Some(event) = event else {
-                    if device_task.is_finished() {
-                        warn!("shortcut device task stopped; restarting generation");
-                    } else {
-                        warn!("shortcut device event channel closed; restarting generation");
-                    }
-                    break;
-                };
+                let Some(event) = event else { break; };
                 let now = unix_now();
                 if controller.handle_device_event(&event, now)? {
                     if let shortcut::device::DeviceEvent::AuthenticatedHandshake { session } = event {
@@ -363,28 +356,65 @@ async fn run_generation_inner(
                 }
                 current_snapshot = current;
                 let now = unix_now();
+                let local_is_hub = current_snapshot.peers.len() > 1;
                 for peer in &current_snapshot.peers {
-                    if snapshot.public_key >= peer.public_key
-                        || peer.latest_handshake == 0
+                    if peer.latest_handshake == 0
                         || now.saturating_sub(peer.latest_handshake) > 180
                         || next_issue.get(&peer.public_key).is_some_and(|next| now < *next)
                     {
                         continue;
                     }
-                    tracing::debug!(peer = %short(&peer.public_key), "attempting direct shortcut issue");
-                    match issue_direct_shortcut(
-                        &snapshot.public_key,
-                        &interface_addresses,
-                        peer,
-                        now,
-                        &mut controller,
-                        shortcut_outbound.clone(),
-                    ).await {
-                        Ok(session) => {
-                            session_peers.insert(session, peer.public_key.clone());
-                            next_issue.insert(peer.public_key.clone(), now.saturating_add(10));
+                    let Some(remote_address) = host_allowed_address(peer) else {
+                        continue;
+                    };
+                    let Some(local_address) = interface_addresses
+                        .iter()
+                        .copied()
+                        .find(|address| address.is_ipv4() == remote_address.is_ipv4())
+                    else {
+                        continue;
+                    };
+                    let remote_selectors = if local_is_hub {
+                        current_snapshot
+                            .peers
+                            .iter()
+                            .filter(|other| other.public_key != peer.public_key)
+                            .filter_map(host_allowed_address)
+                            .filter(|address| address.is_ipv4() == remote_address.is_ipv4())
+                            .collect::<Vec<_>>()
+                    } else if snapshot.public_key < peer.public_key {
+                        vec![local_address]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut issued = false;
+                    for remote_selector in remote_selectors {
+                        tracing::debug!(
+                            peer = %short(&peer.public_key),
+                            selector = %remote_selector,
+                            hub = local_is_hub,
+                            "attempting shortcut issue"
+                        );
+                        match issue_shortcut(
+                            &snapshot.public_key,
+                            local_address,
+                            peer,
+                            remote_address,
+                            host_selector(remote_address),
+                            host_selector(remote_selector),
+                            now,
+                            &mut controller,
+                            shortcut_outbound.clone(),
+                        ).await {
+                            Ok(session) => {
+                                session_peers.insert(session, peer.public_key.clone());
+                                issued = true;
+                            }
+                            Err(error) => debug_error("shortcut issue failed", &error),
                         }
-                        Err(error) => debug_error("direct shortcut issue failed", &error),
+                    }
+                    if issued {
+                        next_issue.insert(peer.public_key.clone(), now.saturating_add(10));
                     }
                 }
                 for session in controller.expire(now)? {
@@ -421,28 +451,17 @@ async fn run_generation_inner(
     Ok(())
 }
 
-async fn issue_direct_shortcut<R: shortcut::state::RouteManager>(
+async fn issue_shortcut<R: shortcut::state::RouteManager>(
     local_public_key: &str,
-    local_addresses: &[IpAddr],
+    local_address: IpAddr,
     peer: &wireguard::Peer,
+    remote_address: IpAddr,
+    upstream_selector: ipnet::IpNet,
+    downstream_selector: ipnet::IpNet,
     now: u64,
     controller: &mut shortcut::controller::ShortcutController<R>,
     outbound: mpsc::Sender<broker::RelayPacket>,
 ) -> Result<shortcut::state::SessionKey> {
-    let remote_address = peer
-        .allowed_ips
-        .iter()
-        .find_map(|network| {
-            ((network.addr().is_ipv4() && network.prefix_len() == 32)
-                || (network.addr().is_ipv6() && network.prefix_len() == 128))
-                .then_some(network.addr())
-        })
-        .ok_or_else(|| anyhow::anyhow!("peer has no host AllowedIP for in-band control"))?;
-    let local_address = local_addresses
-        .iter()
-        .copied()
-        .find(|address| address.is_ipv4() == remote_address.is_ipv4())
-        .ok_or_else(|| anyhow::anyhow!("no matching local WireGuard address family"))?;
     let local = shortcut::cascade::CascadePeer {
         public_key: local_public_key.to_string(),
         peer_id: local_public_key.to_string(),
@@ -457,8 +476,8 @@ async fn issue_direct_shortcut<R: shortcut::state::RouteManager>(
         issuer_public_key: local_public_key,
         upstream: &local,
         downstream: &remote,
-        upstream_selector: host_selector(remote_address),
-        downstream_selector: host_selector(local_address),
+        upstream_selector,
+        downstream_selector,
         parent: None,
         now,
     })?;
@@ -473,6 +492,14 @@ async fn issue_direct_shortcut<R: shortcut::state::RouteManager>(
     controller
         .receive_ticket(pair.upstream, local_public_key, now, outbound)
         .await
+}
+
+fn host_allowed_address(peer: &wireguard::Peer) -> Option<IpAddr> {
+    peer.allowed_ips.iter().find_map(|network| {
+        ((network.addr().is_ipv4() && network.prefix_len() == 32)
+            || (network.addr().is_ipv6() && network.prefix_len() == 128))
+            .then_some(network.addr())
+    })
 }
 
 fn host_selector(address: IpAddr) -> ipnet::IpNet {
