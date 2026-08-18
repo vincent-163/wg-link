@@ -97,6 +97,9 @@ normal WireGuard configuration.
 
 The proposed route-delegation protocol for replacing an authenticated
 two-hop WireGuard path with a direct peer relationship is documented in
-[`docs/shortcut-routing.md`](docs/shortcut-routing.md). The safe kernel mode is
-limited to strictly more-specific shortcut prefixes; equal-prefix takeover
-requires a custom userspace route selector or persistent recovery state.
+[`docs/shortcut-routing.md`](docs/shortcut-routing.md). It uses first-packet
+transit detection, two in-band tickets sent through the existing WireGuard
+paths, and a separate non-persistent TUN backed by an in-process userspace
+WireGuard engine. The main interface and its `AllowedIPs` remain unchanged;
+active destinations enter a dedicated policy table whose default device is the
+shortcut TUN.
