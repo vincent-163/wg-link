@@ -1,0 +1,94 @@
+# wg-link
+
+> Experimental: the peer-id data path is functional, but configuration and
+> wire framing may still change before a stable release.
+
+`wg-linkd` takes over WireGuard peer endpoints without storing private keys or
+network configuration. It only needs a WireGuard interface name and reads the
+interface's live public key, listen port, peers, endpoints, and handshake state
+through `wg show`.
+
+For each peer it:
+
+- assigns a loopback UDP endpoint and listens on one UDP port;
+- embeds one no-TUN EasyTier instance per configured relay in the `wg-linkd`
+  process, without spawning `easytier-core` or `easytier-cli`;
+- joins the relay's open EasyTier network and participates in unrestricted peer
+  discovery and packet relaying;
+- derives a provider-scoped EasyTier hostname from the WireGuard public key and
+  relay identity, then resolves that hostname to EasyTier's routed `peer_id`,
+  so identities cannot be correlated across relays by the advertised name;
+- exposes only the wg-link EasyTier listener endpoint; the real WireGuard
+  listen port remains local and is never placed in EasyTier hostnames, tracker
+  records, or DHT records;
+- wraps WireGuard UDP datagrams in a small public-key-addressed frame and sends
+  them directly with EasyTier's `send_msg_for_proxy` peer routing API; no
+  EasyTier virtual IP, TUN route, or UDP port-forward is involved;
+- treats a newer WireGuard `latest_handshake` value as authenticated success;
+- continuously restores the managed endpoint if WireGuard roaming changes it.
+
+Discovery providers are optional. STUN defaults to
+`stun.cloudflare.com:3478`; HTTP trackers, UDP trackers, and Mainline DHT can
+feed additional public UDP candidates into the running EasyTier connector.
+Discovery is refreshed every five minutes by default and can be adjusted with
+`--discovery-interval-seconds` (minimum 30 seconds).
+
+Tracker and DHT keys are derived from the WireGuard public key plus the
+relay/provider identity. Each tracker has its own identity domain, so
+registrations on different trackers are not directly linkable. A tracker
+registers the local endpoint only under the local public-key hash; peer hashes
+are queried with a `stopped` announce so the lookup does not leave a persistent
+registration under the remote identity. Mainline DHT similarly announces only
+the local key and queries each configured peer key. HTTP and UDP compact peer
+responses support both IPv4 and IPv6.
+
+STUN is also refreshed periodically, and the same server is passed into the
+embedded EasyTier instance for NAT classification and hole punching. Private,
+loopback, link-local, documentation, and CGNAT candidates returned by discovery
+providers are discarded.
+
+The daemon does not publish interface addresses, routes, internal subnets,
+WireGuard configuration, or private keys. Its only advertised identity is the
+provider-scoped EasyTier hostname derived from the WireGuard public key; the
+vendored EasyTier collector is patched not to advertise physical-interface
+addresses. WireGuard itself remains the authentication boundary:
+unauthenticated or impersonated EasyTier peers cannot produce a successful
+WireGuard handshake.
+
+## Build
+
+```bash
+PROTOC=/path/to/recent/protoc cargo build --release
+```
+
+EasyTier's protobuf definitions require a recent `protoc` with proto3 optional
+support. Rust `1.85` or newer is required for edition 2024; the validated build
+uses Rust `1.97.1` and `protoc 27.3`.
+
+## Run
+
+Run as root or with the capabilities required to call `wg set`:
+
+```bash
+RUST_LOG=wg_linkd=info ./target/release/wg-linkd \
+  --interface wg-link0 \
+  --relay tcp://relay.example.com:11010
+```
+
+Optional discovery:
+
+```bash
+./target/release/wg-linkd \
+  --interface wg-link0 \
+  --relay tcp://relay.example.com:11010 \
+  --dht \
+  --http-tracker https://tracker.example/announce \
+  --udp-tracker udp://tracker.example:6969/announce
+```
+
+The tracker and DHT options may be repeated. Newly discovered endpoints are
+added to EasyTier at runtime; restarting `wg-linkd` is not required.
+
+The daemon deliberately does not create WireGuard interfaces, assign tunnel
+addresses, install routes, or persist keys. Those remain owned by the system's
+normal WireGuard configuration.
