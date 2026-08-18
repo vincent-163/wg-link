@@ -99,8 +99,8 @@ impl PeerPacketFilter for WgPacketFilter {
 }
 
 pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToken) -> Result<()> {
-    let provider = format!("easytier|{}", spec.relay);
-    let network_name = identity::relay_network(&provider);
+    let network_name = identity::transport_network();
+    let mut advertised_period = identity::current_peer_id_period();
     let discovery_context = DiscoveryContext {
         local_public_key: spec.local_public_key.clone(),
         listener_port: spec.listener_port,
@@ -110,7 +110,7 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
             .map(|peer| peer.public_key.clone())
             .collect(),
     };
-    let config_text = build_config(&config, &spec, &network_name, &[]);
+    let config_text = build_config(&config, &spec, &network_name, advertised_period, &[]);
     let inbound = spec
         .peers
         .iter()
@@ -126,6 +126,7 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
         .await
         .context("embedded EasyTier failed to start")?;
     let peer_manager = instance.get_peer_manager();
+    let global_ctx = peer_manager.get_global_ctx();
     peer_manager
         .add_peer_packet_filter(WgPacketFilter {
             local_public_key: spec.local_public_key.clone(),
@@ -137,6 +138,7 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
     info!(
         relay = %spec.relay,
         network = %network_name,
+        peer_id_period = advertised_period,
         easytier_peer_id = peer_manager.my_peer_id(),
         listener_port = spec.listener_port,
         "embedded EasyTier peer_id transport started"
@@ -147,7 +149,6 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
     let discovery_task = tokio::spawn(run_discovery_loop(
         config.clone(),
         discovery_context,
-        provider.clone(),
         config.discovery_interval(),
         candidate_tx,
         discovery_cancel.clone(),
@@ -176,6 +177,21 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
                 }
             }
             _ = refresh.tick() => {
+                let current_period = identity::current_peer_id_period();
+                if current_period != advertised_period {
+                    advertised_period = current_period;
+                    let hostname = identity::rotating_node_name(
+                        &spec.local_public_key,
+                        advertised_period,
+                    );
+                    global_ctx.set_hostname(hostname.clone());
+                    info!(
+                        relay = %spec.relay,
+                        peer_id_period = advertised_period,
+                        %hostname,
+                        "rotated hourly EasyTier peer identity"
+                    );
+                }
                 let mut discovered = HashMap::new();
                 for route in peer_manager.list_routes().await {
                     if peer_ids_by_hostname.get(&route.hostname) != Some(&route.peer_id) {
@@ -187,11 +203,11 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
             }
             packet = outbound.recv() => {
                 let Some(packet) = packet else { break; };
-                let target_hostname = format!(
-                    "wgl-{}",
-                    identity::provider_node_id(&packet.peer_key, &provider)
-                );
-                let Some(&dst_peer_id) = peer_ids_by_hostname.get(&target_hostname) else {
+                let Some((target_period, target_hostname, dst_peer_id)) = resolve_peer_id(
+                    &peer_ids_by_hostname,
+                    &packet.peer_key,
+                    unix_now(),
+                ) else {
                     debug!(relay = %spec.relay, peer = %short(&packet.peer_key), "dropping WireGuard packet until EasyTier peer_id is resolved");
                     continue;
                 };
@@ -210,7 +226,7 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
                 if let Err(error) = peer_manager.send_msg_for_proxy(zc_packet, dst_peer_id).await {
                     warn!(relay = %spec.relay, peer = %short(&packet.peer_key), dst_peer_id, %error, "EasyTier peer_id send failed");
                 } else {
-                    debug!(relay = %spec.relay, peer = %short(&packet.peer_key), dst_peer_id, bytes = packet.payload.len(), "sent WireGuard packet by EasyTier peer_id");
+                    debug!(relay = %spec.relay, peer = %short(&packet.peer_key), target_period, %target_hostname, dst_peer_id, bytes = packet.payload.len(), "sent WireGuard packet by EasyTier peer_id");
                 }
             }
         }
@@ -224,7 +240,6 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
 async fn run_discovery_loop(
     config: Config,
     context: DiscoveryContext,
-    provider: String,
     interval: Duration,
     sender: mpsc::Sender<Vec<SocketAddr>>,
     cancel: CancellationToken,
@@ -232,17 +247,11 @@ async fn run_discovery_loop(
     let mut first_announce = true;
     let mut local_public_ips = HashSet::new();
     loop {
-        let candidates = discover_candidates(
-            &config,
-            &context,
-            &provider,
-            first_announce,
-            &mut local_public_ips,
-        )
-        .await;
+        let candidates =
+            discover_candidates(&config, &context, first_announce, &mut local_public_ips).await;
         first_announce = false;
         info!(
-            %provider,
+            peer_id_periods = ?identity::active_peer_id_periods(unix_now()),
             candidate_count = candidates.len(),
             "peer discovery refresh completed"
         );
@@ -259,7 +268,6 @@ async fn run_discovery_loop(
 async fn discover_candidates(
     config: &Config,
     context: &DiscoveryContext,
-    provider: &str,
     first_announce: bool,
     local_public_ips: &mut HashSet<IpAddr>,
 ) -> Vec<SocketAddr> {
@@ -280,57 +288,63 @@ async fn discover_candidates(
     } else {
         discovery::tracker::AnnounceEvent::Update
     };
+    let active_periods = identity::active_peer_id_periods(unix_now());
     for tracker in config
         .http_trackers
         .iter()
         .chain(config.udp_trackers.iter())
     {
-        let tracker_provider = format!("{provider}|tracker|{tracker}");
-        let own_peer_id = identity::peer_id(&context.local_public_key, &tracker_provider);
-        let own_hash = identity::info_hash(&context.local_public_key, &tracker_provider);
-        match discovery::tracker::query(
-            tracker,
-            own_hash,
-            own_peer_id,
-            context.listener_port,
-            tracker_event,
-        )
-        .await
-        {
-            Ok(found) => candidates.extend(found),
-            Err(error) => warn!(tracker, %error, "tracker self announce failed"),
-        }
-        for peer_key in &context.peer_public_keys {
-            let peer_hash = identity::info_hash(peer_key, &tracker_provider);
+        for period in active_periods {
+            let tracker_provider =
+                format!("{}|tracker|{tracker}", identity::discovery_scope(period));
+            let own_peer_id = identity::peer_id(&context.local_public_key, &tracker_provider);
+            let own_hash = identity::info_hash(&context.local_public_key, &tracker_provider);
             match discovery::tracker::query(
                 tracker,
-                peer_hash,
+                own_hash,
                 own_peer_id,
                 context.listener_port,
-                discovery::tracker::AnnounceEvent::Stopped,
+                tracker_event,
             )
             .await
             {
                 Ok(found) => candidates.extend(found),
-                Err(error) => {
-                    warn!(tracker, peer = %short(peer_key), %error, "tracker peer lookup failed")
+                Err(error) => warn!(tracker, period, %error, "tracker self announce failed"),
+            }
+            for peer_key in &context.peer_public_keys {
+                let peer_hash = identity::info_hash(peer_key, &tracker_provider);
+                match discovery::tracker::query(
+                    tracker,
+                    peer_hash,
+                    own_peer_id,
+                    context.listener_port,
+                    discovery::tracker::AnnounceEvent::Stopped,
+                )
+                .await
+                {
+                    Ok(found) => candidates.extend(found),
+                    Err(error) => {
+                        warn!(tracker, period, peer = %short(peer_key), %error, "tracker peer lookup failed")
+                    }
                 }
             }
         }
     }
 
     if config.dht {
-        let dht_provider = format!("{provider}|dht-mainline");
-        for peer_key in &context.peer_public_keys {
-            match discovery::dht::announce_and_discover(
-                identity::info_hash(&context.local_public_key, &dht_provider),
-                identity::info_hash(peer_key, &dht_provider),
-                context.listener_port,
-            )
-            .await
-            {
-                Ok(found) => candidates.extend(found),
-                Err(error) => warn!(%error, "DHT discovery failed"),
+        for period in active_periods {
+            let dht_provider = format!("{}|dht-mainline", identity::discovery_scope(period));
+            for peer_key in &context.peer_public_keys {
+                match discovery::dht::announce_and_discover(
+                    identity::info_hash(&context.local_public_key, &dht_provider),
+                    identity::info_hash(peer_key, &dht_provider),
+                    context.listener_port,
+                )
+                .await
+                {
+                    Ok(found) => candidates.extend(found),
+                    Err(error) => warn!(period, %error, "DHT discovery failed"),
+                }
             }
         }
     }
@@ -357,14 +371,14 @@ fn build_config(
     config: &Config,
     spec: &RelaySpec,
     network_name: &str,
+    peer_id_period: u64,
     candidates: &[SocketAddr],
 ) -> String {
-    let node_id =
-        identity::provider_node_id(&spec.local_public_key, &format!("easytier|{}", spec.relay));
+    let node_name = identity::rotating_node_name(&spec.local_public_key, peer_id_period);
     let mut text = format!(
         "instance_name = {}\nhostname = {}\ndhcp = false\nlisteners = [{}]\nstun_servers = [{}]\n\n[network_identity]\nnetwork_name = {}\nnetwork_secret = \"\"\n\n",
-        toml_string(&format!("wgl-{node_id}")),
-        toml_string(&format!("wgl-{node_id}")),
+        toml_string(&node_name),
+        toml_string(&node_name),
         toml_string(&format!("udp://0.0.0.0:{}", spec.listener_port)),
         toml_string(&config.stun),
         toml_string(network_name),
@@ -380,6 +394,27 @@ fn build_config(
         "[flags]\nno_tun = true\nuse_smoltcp = true\nlatency_first = true\nprivate_mode = false\nrelay_network_whitelist = \"*\"\ndisable_p2p = false\ndisable_udp_hole_punching = false\nmulti_thread = false\n",
     );
     text
+}
+
+fn resolve_peer_id(
+    peer_ids_by_hostname: &HashMap<String, u32>,
+    peer_key: &str,
+    unix_seconds: u64,
+) -> Option<(u64, String, u32)> {
+    for period in identity::active_peer_id_periods(unix_seconds) {
+        let hostname = identity::rotating_node_name(peer_key, period);
+        if let Some(&peer_id) = peer_ids_by_hostname.get(&hostname) {
+            return Some((period, hostname, peer_id));
+        }
+    }
+    None
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 struct DecodedFrame<'a> {
@@ -567,5 +602,40 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn peer_resolution_prefers_current_hour() {
+        let peer_key = "peer-public-key";
+        let current = identity::rotating_node_name(peer_key, 2);
+        let previous = identity::rotating_node_name(peer_key, 1);
+        let routes = HashMap::from([(previous, 11), (current.clone(), 22)]);
+
+        assert_eq!(
+            resolve_peer_id(&routes, peer_key, 7_200),
+            Some((2, current, 22))
+        );
+    }
+
+    #[test]
+    fn peer_resolution_accepts_previous_hour_only() {
+        let peer_key = "peer-public-key";
+        let previous = identity::rotating_node_name(peer_key, 1);
+        let expired = identity::rotating_node_name(peer_key, 0);
+        let routes = HashMap::from([(previous.clone(), 11), (expired, 33)]);
+
+        assert_eq!(
+            resolve_peer_id(&routes, peer_key, 7_200),
+            Some((1, previous, 11))
+        );
+    }
+
+    #[test]
+    fn peer_resolution_rejects_expired_hour() {
+        let peer_key = "peer-public-key";
+        let expired = identity::rotating_node_name(peer_key, 0);
+        let routes = HashMap::from([(expired, 33)]);
+
+        assert_eq!(resolve_peer_id(&routes, peer_key, 7_200), None);
     }
 }

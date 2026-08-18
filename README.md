@@ -15,9 +15,11 @@ For each peer it:
   process, without spawning `easytier-core` or `easytier-cli`;
 - joins the relay's open EasyTier network and participates in unrestricted peer
   discovery and packet relaying;
-- derives a provider-scoped EasyTier hostname from the WireGuard public key and
-  relay identity, then resolves that hostname to EasyTier's routed `peer_id`,
-  so identities cannot be correlated across relays by the advertised name;
+- derives an hourly EasyTier hostname from the WireGuard public key and the
+  current UTC Unix-hour period, then resolves both the current and previous
+  period to EasyTier's routed `peer_id`; relay addresses do not participate in
+  the identity hash, each ID is created hourly, and each remains usable for a
+  two-hour sliding window;
 - exposes only the wg-link EasyTier listener endpoint; the real WireGuard
   listen port remains local and is never placed in EasyTier hostnames, tracker
   records, or DHT records;
@@ -33,14 +35,21 @@ feed additional public UDP candidates into the running EasyTier connector.
 Discovery is refreshed every five minutes by default and can be adjusted with
 `--discovery-interval-seconds` (minimum 30 seconds).
 
-Tracker and DHT keys are derived from the WireGuard public key plus the
-relay/provider identity. Each tracker has its own identity domain, so
-registrations on different trackers are not directly linkable. A tracker
-registers the local endpoint only under the local public-key hash; peer hashes
-are queried with a `stopped` announce so the lookup does not leave a persistent
-registration under the remote identity. Mainline DHT similarly announces only
-the local key and queries each configured peer key. HTTP and UDP compact peer
-responses support both IPv4 and IPv6.
+The hourly periods use UTC Unix time. Nodes should have working clock
+synchronization; accepting the current and previous periods tolerates normal
+hour-boundary propagation delays but is not a substitute for NTP.
+
+Tracker and DHT keys are derived from the WireGuard public key, the tracker or
+DHT identity domain, and the same hourly period. The daemon announces and
+queries both currently valid periods, so relay address changes do not alter
+discovery identities and an hour-boundary update does not interrupt discovery.
+Each tracker has its own identity domain, so registrations on different
+trackers are not directly linkable. A tracker registers the local endpoint only
+under the local public-key hash; peer hashes are queried with a `stopped`
+announce so the lookup does not leave a persistent registration under the
+remote identity. Mainline DHT similarly announces only the local key and
+queries each configured peer key. HTTP and UDP compact peer responses support
+both IPv4 and IPv6.
 
 STUN is also refreshed periodically, and the same server is passed into the
 embedded EasyTier instance for NAT classification and hole punching. Private,
@@ -49,8 +58,8 @@ providers are discarded.
 
 The daemon does not publish interface addresses, routes, internal subnets,
 WireGuard configuration, or private keys. Its only advertised identity is the
-provider-scoped EasyTier hostname derived from the WireGuard public key; the
-vendored EasyTier collector is patched not to advertise physical-interface
+hourly EasyTier hostname derived from the WireGuard public key and UTC period;
+the vendored EasyTier collector is patched not to advertise physical-interface
 addresses. WireGuard itself remains the authentication boundary:
 unauthenticated or impersonated EasyTier peers cannot produce a successful
 WireGuard handshake.
