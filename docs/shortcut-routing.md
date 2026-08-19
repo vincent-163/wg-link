@@ -356,6 +356,13 @@ is required.
 | Ticket lost to one endpoint | No shortcut handshake; traffic stays on A |
 | Direct UDP fails | Shortcut WireGuard uses EasyTier peer-ID relay |
 
+| Shortcut handshake fails | Policy rule is never installed |
+| A stops or stops renewing | Lease expires and policy rule is removed |
+| L or B process crashes | Non-persistent TUN disappears; main route through A remains |
+| Main WG config changes | A revokes renewal; endpoints remove the lease |
+| Endpoint candidate changes | Renewal carries new hints; peer-ID bootstrap remains available |
+| One-sided renewal | Direct health check fails or epoch expires; both return to A |
+
 EasyTier may now learn a physical-LAN UDP candidate through the authenticated
 deployment's private-LAN discovery socket. That improves the transport between
 nodes which are already EasyTier peers, but it does not by itself turn two
@@ -363,12 +370,6 @@ hosts that only share a WireGuard hub into direct WireGuard peers. Hub-mediated
 multi-hop shortcut routing still requires a dynamic peer-key route in the
 shortcut dispatcher; until that is present, the end-to-end shortcut remains
 hub-mediated even when the underlying EasyTier nodes have a direct LAN path.
-| Shortcut handshake fails | Policy rule is never installed |
-| A stops or stops renewing | Lease expires and policy rule is removed |
-| L or B process crashes | Non-persistent TUN disappears; main route through A remains |
-| Main WG config changes | A revokes renewal; endpoints remove the lease |
-| Endpoint candidate changes | Renewal carries new hints; peer-ID bootstrap remains available |
-| One-sided renewal | Direct health check fails or epoch expires; both return to A |
 
 No base `AllowedIPs` entry is moved or deleted, so crash recovery requires no
 persistent network-configuration journal.
