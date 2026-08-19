@@ -177,8 +177,15 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
         config.clone(),
         discovery_context,
         config.discovery_interval(),
-        candidate_tx,
+        candidate_tx.clone(),
         discovery_cancel.clone(),
+    ));
+    let lan_discovery_task = tokio::spawn(discovery::lan::run_loop(
+        spec.local_public_key.clone(),
+        network_name.clone(),
+        spec.listener_port,
+        candidate_tx,
+        cancel.child_token(),
     ));
     let conn_manager = instance.get_conn_manager();
     let mut candidate_urls = HashSet::new();
@@ -341,6 +348,8 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
     }
     discovery_cancel.cancel();
     let _ = discovery_task.await;
+    lan_discovery_task.abort();
+    let _ = lan_discovery_task.await;
     instance.clear_resources().await;
     Ok(())
 }

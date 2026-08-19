@@ -82,6 +82,29 @@ addresses. WireGuard itself remains the authentication boundary:
 unauthenticated or impersonated EasyTier peers cannot produce a successful
 WireGuard handshake.
 
+### LAN EasyTier discovery
+
+In addition to public STUN/tracker/DHT discovery, each embedded EasyTier node
+announces a short-lived rotating node identifier on the private LAN using UDP
+port `38391`. The announcement contains no relay URL or stable WireGuard
+public key. Receivers accept only packets from the same private interface
+subnet, the current or previous UTC identity period, and the shared transport
+network; the announced listener port is then added as an EasyTier UDP
+candidate. This allows EasyTier to establish a direct physical-LAN path while
+leaving peer authentication and WireGuard policy unchanged.
+
+On hosts with a default-deny firewall, allow the discovery port only on the
+physical LAN interface and subnet, for example:
+
+```bash
+sudo ufw allow in on eno1 from 192.168.1.0/24 to any port 38391 proto udp \
+  comment 'wg-link LAN EasyTier discovery'
+```
+
+Do not expose `38391/udp` to the public Internet. The listener port used by
+EasyTier itself still requires the host's normal firewall policy to permit
+the intended LAN transport.
+
 ## Build
 
 ```bash
