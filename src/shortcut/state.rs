@@ -168,6 +168,20 @@ impl<R: RouteManager> ShortcutManager<R> {
         Ok(expired)
     }
 
+    pub fn retire_draining(&mut self) -> Vec<SessionKey> {
+        let draining = self
+            .sessions
+            .iter()
+            .filter_map(|(session, managed)| {
+                (managed.phase == SessionPhase::Draining).then_some(*session)
+            })
+            .collect::<Vec<_>>();
+        for session in &draining {
+            self.sessions.remove(session);
+        }
+        draining
+    }
+
     pub fn fail(&mut self, session: SessionKey) -> Result<bool> {
         let Some(managed) = self.sessions.remove(&session) else {
             return Ok(false);
@@ -287,6 +301,10 @@ mod tests {
             .unwrap();
         assert_eq!(manager.routes().activations.len(), 2);
         assert_eq!(manager.phase(first.session), Some(SessionPhase::Draining));
+        assert_eq!(manager.phase(second.session), Some(SessionPhase::Active));
+
+        assert_eq!(manager.retire_draining(), vec![first.session]);
+        assert_eq!(manager.phase(first.session), None);
         assert_eq!(manager.phase(second.session), Some(SessionPhase::Active));
     }
 

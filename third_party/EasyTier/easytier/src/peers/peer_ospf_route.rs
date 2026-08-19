@@ -809,10 +809,7 @@ impl SyncedRouteInfo {
             if info.peer_route_id != my_peer_route_id
                 && info.version > self.get_peer_info_version_with_default(info.peer_id)
             {
-                // if dst peer send to us with higher version info of my peer, our peer id is duplicated
-                // TODO: handle this better. restart peer manager?
-                panic!("my peer id is duplicated");
-                // return Err(Error::DuplicatePeerId);
+                return Err(Error::DuplicatePeerId);
             }
         } else if info.peer_id == dst_peer_id {
             let Some(dst_peer_route_id) = dst_peer_route_id else {
@@ -3034,7 +3031,14 @@ impl PeerRouteServiceImpl {
                 if let Some(err) = resp.error {
                     if err == Error::DuplicatePeerId as i32 {
                         if !self.global_ctx.get_feature_flags().is_public_server {
-                            panic!("duplicate peer id");
+                            tracing::warn!(
+                                ?my_peer_id,
+                                ?dst_peer_id,
+                                "transient duplicate peer route; retrying sync"
+                            );
+                            session
+                                .need_sync_initiator_info
+                                .store(true, Ordering::Relaxed);
                         }
                     } else {
                         tracing::error!(?ret, ?my_peer_id, ?dst_peer_id, "sync_route_info failed");

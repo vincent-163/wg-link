@@ -80,6 +80,8 @@ mod tests {
             upstream_selector: IpNet::from_str("198.51.100.7/32").unwrap(),
             downstream_selector: IpNet::from_str("203.0.113.9/32").unwrap(),
             parent: None,
+            expires_at_limit: None,
+            renew_after_seconds: None,
             now: 1_000,
         })
         .unwrap();
@@ -149,6 +151,8 @@ mod tests {
             upstream_selector: opportunity.upstream_selector,
             downstream_selector: opportunity.downstream_selector,
             parent: Some(&parent),
+            expires_at_limit: None,
+            renew_after_seconds: None,
             now: 1_003,
         })
         .unwrap();

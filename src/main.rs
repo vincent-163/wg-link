@@ -12,7 +12,6 @@ use anyhow::Result;
 use broker::{PathSet, PathTarget, RelayChannel};
 use clap::Parser;
 use config::Config;
-use shortcut::renewal::{IssueKey, RenewalScheduler};
 use std::{
     collections::HashMap,
     net::IpAddr,
@@ -27,6 +26,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+const BASE_HANDSHAKE_LIFETIME_SECONDS: u64 = 180;
+const HUB_SHORTCUT_RENEWAL_LEAD_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GenerationKey {
@@ -191,6 +193,7 @@ async fn run_generation_inner(
     }
 
     let mut relay_tasks = Vec::new();
+    let mut dynamic_targets = Vec::new();
     let (shortcut_inbound_sender, mut shortcut_inbound_receiver) = mpsc::channel(256);
     for (relay_index, relay) in config.relays.iter().enumerate() {
         let path_id = format!("et-{}", &blake3::hash(relay.as_bytes()).to_hex()[..12]);
@@ -205,6 +208,12 @@ async fn run_generation_inner(
             &[&snapshot.public_key, relay],
         );
         let (relay_sender, relay_receiver) = mpsc::channel(256);
+        dynamic_targets.push(PathTarget {
+            id: path_id.clone(),
+            label: format!("relay-{}", relay_index + 1),
+            protocol: protocol.clone(),
+            sender: relay_sender.clone(),
+        });
         let mut peer_routes = Vec::new();
         for peer in &snapshot.peers {
             peer_routes.push(easytier::PeerRoute {
@@ -263,6 +272,7 @@ async fn run_generation_inner(
     let (shortcut_outbound, shortcut_dispatch_receiver) = mpsc::channel(256);
     let shortcut_dispatch_task = tokio::spawn(broker::run_dispatcher(
         path_maps.clone(),
+        dynamic_targets,
         management.metrics.clone(),
         shortcut_dispatch_receiver,
         cancel.child_token(),
@@ -290,7 +300,7 @@ async fn run_generation_inner(
     let mut control_receiver = control_runtime.receiver;
     let control_tasks = control_runtime.tasks;
     let mut current_snapshot = snapshot.clone();
-    let mut renewals = RenewalScheduler::default();
+    let mut hub_issues = HashMap::<HubIssueKey, u64>::new();
     let mut poll = tokio::time::interval(config.poll_interval());
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -318,77 +328,15 @@ async fn run_generation_inner(
                 }
                 current_snapshot = current;
                 let now = unix_now();
-                let local_is_hub = current_snapshot.peers.len() > 1;
-                for peer in &current_snapshot.peers {
-                    if peer.latest_handshake == 0 || !local_is_hub {
-                        continue;
-                    }
-                    let Some(remote_address) = host_allowed_address(peer) else {
-                        continue;
-                    };
-                    let Some(local_address) = interface_addresses
-                        .iter()
-                        .copied()
-                        .find(|address| address.is_ipv4() == remote_address.is_ipv4())
-                    else {
-                        continue;
-                    };
-                    let remote_selectors = current_snapshot
-                        .peers
-                        .iter()
-                        .filter(|other| other.public_key != peer.public_key)
-                        .filter_map(host_allowed_address)
-                        .filter(|address| address.is_ipv4() == remote_address.is_ipv4())
-                        .collect::<Vec<_>>();
-                    for remote_selector in remote_selectors {
-                        let issue = IssueKey {
-                            peer_public_key: peer.public_key.clone(),
-                            downstream_selector: host_selector(remote_selector),
-                        };
-                        if now.saturating_sub(peer.latest_handshake) > 180
-                            && !renewals.has_active(&issue)
-                        {
-                            continue;
-                        }
-                        let Some(attempt) = renewals.begin_issue(&issue, now) else {
-                            continue;
-                        };
-                        if let Some(session) = attempt.stale_pending {
-                            if let Err(error) = controller.fail(session) {
-                                debug_error("failed to discard timed out shortcut session", &error);
-                            }
-                            if let Err(error) = device.remove(session).await {
-                                debug_error("failed to remove timed out shortcut device session", &error);
-                            }
-                            renewals.removed(session, now);
-                        }
-                        tracing::debug!(
-                            peer = %short(&peer.public_key),
-                            selector = %remote_selector,
-                            hub = local_is_hub,
-                            "attempting shortcut issue"
-                        );
-                        match issue_shortcut(
-                            &snapshot.public_key,
-                            local_address,
-                            peer,
-                            remote_address,
-                            host_selector(remote_address),
-                            host_selector(remote_selector),
-                            now,
-                            &mut controller,
-                            shortcut_outbound.clone(),
-                        ).await {
-                            Ok(issued) => {
-                                renewals.issued(issue, issued.session, issued.renew_at, now);
-                            }
-                            Err(error) => debug_error("shortcut issue failed", &error),
-                        }
-                    }
-                }
+                issue_hub_shortcuts(
+                    &snapshot.public_key,
+                    &interface_addresses,
+                    &current_snapshot,
+                    now,
+                    &mut hub_issues,
+                ).await;
                 for session in controller.expire(now)? {
                     device.remove(session).await?;
-                    renewals.removed(session, now);
                 }
             }
             control = control_receiver.recv() => {
@@ -397,21 +345,50 @@ async fn run_generation_inner(
                     continue;
                 };
                 tracing::debug!(source = %control.source, "received shortcut control datagram");
-                if let shortcut::control::ControlMessage::Ticket { ticket } = control.message {
-                    let now = unix_now();
-                    let Some(sender) = current_snapshot.route_peer(control.source, None) else {
-                        tracing::debug!(source = %control.source, "shortcut control source is not an AllowedIP");
-                        continue;
-                    };
-                    if sender.latest_handshake == 0 || now.saturating_sub(sender.latest_handshake) > 180 {
-                        tracing::debug!(peer = %short(&sender.public_key), latest_handshake = sender.latest_handshake, now, "shortcut control base handshake is stale");
-                        continue;
+                match control.message {
+                    shortcut::control::ControlMessage::Keepalive {
+                        reply_requested: true,
+                    } => {
+                        let Some(local_address) = interface_addresses
+                            .iter()
+                            .copied()
+                            .find(|address| address.is_ipv4() == control.source.is_ipv4())
+                        else {
+                            continue;
+                        };
+                        if let Err(error) = shortcut::base_control::send(
+                            local_address,
+                            control.source,
+                            &shortcut::control::ControlMessage::Keepalive {
+                                reply_requested: false,
+                            },
+                        )
+                        .await
+                        {
+                            debug_error("shortcut control keepalive response failed", &error);
+                        }
                     }
-                    let sender_key = sender.public_key.clone();
-                    match controller.receive_ticket(ticket, &sender_key, now, shortcut_outbound.clone()).await {
-                        Ok(_) => {}
-                        Err(error) => debug_error("shortcut ticket rejected", &error),
+                    shortcut::control::ControlMessage::Keepalive {
+                        reply_requested: false,
+                    } => {}
+                    shortcut::control::ControlMessage::Ticket { ticket } => {
+                        let now = unix_now();
+                        let Some(sender) = current_snapshot.route_peer(control.source, None) else {
+                            tracing::debug!(source = %control.source, "shortcut control source is not an AllowedIP");
+                            continue;
+                        };
+                        if !fresh_handshake(sender.latest_handshake, now) {
+                            tracing::debug!(peer = %short(&sender.public_key), latest_handshake = sender.latest_handshake, now, "shortcut control base handshake is stale");
+                            continue;
+                        }
+                        let sender_key = sender.public_key.clone();
+                        match controller.receive_ticket(ticket, &sender_key, now, shortcut_outbound.clone()).await {
+                            Ok(_) => {}
+                            Err(error) => debug_error("shortcut ticket rejected", &error),
+                        }
                     }
+                    shortcut::control::ControlMessage::Revoke { .. }
+                    | shortcut::control::ControlMessage::Status { .. } => {}
                 }
             }
             inbound = shortcut_inbound_receiver.recv() => {
@@ -431,7 +408,6 @@ async fn run_generation_inner(
                 if let shortcut::device::DeviceEvent::SessionFailed { session } = event {
                     match controller.fail(session) {
                         Ok(true) => {
-                            renewals.removed(session, now);
                             info!(?session, "removed failed shortcut session");
                         }
                         Ok(false) => {}
@@ -444,16 +420,15 @@ async fn run_generation_inner(
                     _ => None,
                 };
                 match controller.handle_device_event(&event, now) {
-                    Ok(true) => {
-                        if let Some(session) = authenticated_session {
-                            if let Some(next_issue) = renewals.authenticated(session, now) {
-                                info!(?session, next_issue, "authenticated locally issued shortcut route");
-                            } else {
-                                info!(?session, "authenticated received shortcut route");
-                            }
+                    Ok(outcome) => {
+                        if outcome.activated && let Some(session) = authenticated_session {
+                            info!(?session, "authenticated received shortcut route");
+                        }
+                        for session in outcome.retired {
+                            device.remove(session).await?;
+                            info!(?session, "retired replaced shortcut session");
                         }
                     }
-                    Ok(false) => {}
                     Err(error) => {
                         debug_error("shortcut device event rejected", &error);
                         if let Some(session) = authenticated_session {
@@ -463,7 +438,6 @@ async fn run_generation_inner(
                             if let Err(remove_error) = device.remove(session).await {
                                 debug_error("failed to remove rejected shortcut device session", &remove_error);
                             }
-                            renewals.removed(session, now);
                         }
                     }
                 }
@@ -501,54 +475,207 @@ async fn run_generation_inner(
     Ok(())
 }
 
-async fn issue_shortcut<R: shortcut::state::RouteManager>(
-    local_public_key: &str,
-    local_address: IpAddr,
-    peer: &wireguard::Peer,
-    remote_address: IpAddr,
-    upstream_selector: ipnet::IpNet,
-    downstream_selector: ipnet::IpNet,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HubIssueKey {
+    left_public_key: String,
+    right_public_key: String,
+}
+
+async fn issue_hub_shortcuts(
+    issuer_public_key: &str,
+    interface_addresses: &[IpAddr],
+    snapshot: &wireguard::Snapshot,
     now: u64,
-    controller: &mut shortcut::controller::ShortcutController<R>,
-    outbound: mpsc::Sender<broker::RelayPacket>,
-) -> Result<IssuedShortcut> {
-    let local = shortcut::cascade::CascadePeer {
-        public_key: local_public_key.to_string(),
-        peer_id: local_public_key.to_string(),
-        endpoint_candidates: vec![],
+    issues: &mut HashMap<HubIssueKey, u64>,
+) {
+    if snapshot.peers.len() < 2 {
+        return;
+    }
+    for left_index in 0..snapshot.peers.len() {
+        for right_index in left_index + 1..snapshot.peers.len() {
+            let left = &snapshot.peers[left_index];
+            let right = &snapshot.peers[right_index];
+            let (Some(left_address), Some(right_address)) =
+                (host_allowed_address(left), host_allowed_address(right))
+            else {
+                continue;
+            };
+            if left_address.is_ipv4() != right_address.is_ipv4() {
+                continue;
+            }
+            let Some(local_address) = interface_addresses
+                .iter()
+                .copied()
+                .find(|address| address.is_ipv4() == left_address.is_ipv4())
+            else {
+                continue;
+            };
+            let key = ordered_hub_issue_key(&left.public_key, &right.public_key);
+            if now < issues.get(&key).copied().unwrap_or_default() {
+                continue;
+            }
+            if !renewable_handshake(left.latest_handshake, now)
+                || !renewable_handshake(right.latest_handshake, now)
+            {
+                match refresh_hub_handshakes(local_address, left_address, right_address).await {
+                    Ok(()) => {
+                        issues.insert(key, now.saturating_add(1));
+                        tracing::debug!(
+                            left = %short(&left.public_key),
+                            right = %short(&right.public_key),
+                            "refreshed Hub base handshakes before shortcut renewal"
+                        );
+                    }
+                    Err(error) => {
+                        issues.insert(key, now.saturating_add(5));
+                        debug_error("Hub base handshake refresh failed", &error);
+                    }
+                }
+                continue;
+            }
+            match issue_peer_pair(
+                issuer_public_key,
+                local_address,
+                left,
+                left_address,
+                right,
+                right_address,
+                now,
+            )
+            .await
+            {
+                Ok(next_issue) => {
+                    issues.insert(key, next_issue);
+                }
+                Err(error) => {
+                    issues.insert(key, now.saturating_add(5));
+                    debug_error("peer shortcut issue failed", &error);
+                }
+            }
+        }
+    }
+}
+
+async fn refresh_hub_handshakes(
+    local_address: IpAddr,
+    left_address: IpAddr,
+    right_address: IpAddr,
+) -> Result<()> {
+    let keepalive = shortcut::control::ControlMessage::Keepalive {
+        reply_requested: true,
     };
-    let remote = shortcut::cascade::CascadePeer {
-        public_key: peer.public_key.clone(),
-        peer_id: peer.public_key.clone(),
-        endpoint_candidates: vec![],
-    };
-    let pair = shortcut::cascade::plan(shortcut::cascade::CascadeRequest {
-        issuer_public_key: local_public_key,
-        upstream: &local,
-        downstream: &remote,
-        upstream_selector,
-        downstream_selector,
-        parent: None,
+    shortcut::base_control::send(local_address, left_address, &keepalive).await?;
+    shortcut::base_control::send(local_address, right_address, &keepalive).await?;
+    Ok(())
+}
+
+async fn issue_peer_pair(
+    issuer_public_key: &str,
+    local_address: IpAddr,
+    left: &wireguard::Peer,
+    left_address: IpAddr,
+    right: &wireguard::Peer,
+    right_address: IpAddr,
+    now: u64,
+) -> Result<u64> {
+    let (pair, next_issue) = plan_peer_pair(
+        issuer_public_key,
+        left,
+        left_address,
+        right,
+        right_address,
         now,
-    })?;
-    let renew_at = pair.upstream.renew_at;
+    )?;
     shortcut::base_control::send(
         local_address,
-        remote_address,
+        left_address,
+        &shortcut::control::ControlMessage::Ticket {
+            ticket: pair.upstream,
+        },
+    )
+    .await?;
+    shortcut::base_control::send(
+        local_address,
+        right_address,
         &shortcut::control::ControlMessage::Ticket {
             ticket: pair.downstream,
         },
     )
     .await?;
-    let session = controller
-        .receive_ticket(pair.upstream, local_public_key, now, outbound)
-        .await?;
-    Ok(IssuedShortcut { session, renew_at })
+    info!(
+        left = %short(&left.public_key),
+        right = %short(&right.public_key),
+        next_issue,
+        "issued endpoint-to-endpoint shortcut tickets"
+    );
+    Ok(next_issue)
 }
 
-struct IssuedShortcut {
-    session: shortcut::state::SessionKey,
-    renew_at: u64,
+fn plan_peer_pair(
+    issuer_public_key: &str,
+    left: &wireguard::Peer,
+    left_address: IpAddr,
+    right: &wireguard::Peer,
+    right_address: IpAddr,
+    now: u64,
+) -> Result<(shortcut::cascade::ShortcutTicketPair, u64)> {
+    let period = identity::peer_id_period(now);
+    let left_peer = shortcut::cascade::CascadePeer {
+        public_key: left.public_key.clone(),
+        peer_id: identity::rotating_node_name(&left.public_key, period),
+        endpoint_candidates: vec![],
+    };
+    let right_peer = shortcut::cascade::CascadePeer {
+        public_key: right.public_key.clone(),
+        peer_id: identity::rotating_node_name(&right.public_key, period),
+        endpoint_candidates: vec![],
+    };
+    let handshake_deadline = [left.latest_handshake, right.latest_handshake]
+        .into_iter()
+        .map(|handshake| handshake.saturating_add(BASE_HANDSHAKE_LIFETIME_SECONDS))
+        .min()
+        .unwrap_or(now);
+    let pair = shortcut::cascade::plan(shortcut::cascade::CascadeRequest {
+        issuer_public_key,
+        upstream: &left_peer,
+        downstream: &right_peer,
+        upstream_selector: host_selector(right_address),
+        downstream_selector: host_selector(left_address),
+        parent: None,
+        expires_at_limit: Some(handshake_deadline),
+        renew_after_seconds: None,
+        now,
+    })?;
+    let next_issue = pair
+        .upstream
+        .renew_at
+        .saturating_sub(HUB_SHORTCUT_RENEWAL_LEAD_SECONDS)
+        .max(now + 1);
+    Ok((pair, next_issue))
+}
+
+fn ordered_hub_issue_key(left: &str, right: &str) -> HubIssueKey {
+    if left <= right {
+        HubIssueKey {
+            left_public_key: left.to_string(),
+            right_public_key: right.to_string(),
+        }
+    } else {
+        HubIssueKey {
+            left_public_key: right.to_string(),
+            right_public_key: left.to_string(),
+        }
+    }
+}
+
+fn fresh_handshake(latest_handshake: u64, now: u64) -> bool {
+    latest_handshake != 0 && now.saturating_sub(latest_handshake) <= BASE_HANDSHAKE_LIFETIME_SECONDS
+}
+
+fn renewable_handshake(latest_handshake: u64, now: u64) -> bool {
+    fresh_handshake(latest_handshake, now)
+        && now.saturating_add(shortcut::control::DEFAULT_RENEW_AFTER_SECONDS + 1)
+            <= latest_handshake.saturating_add(BASE_HANDSHAKE_LIFETIME_SECONDS)
 }
 
 fn host_allowed_address(peer: &wireguard::Peer) -> Option<IpAddr> {
@@ -579,4 +706,63 @@ fn debug_error(message: &str, error: &anyhow::Error) {
 
 fn short(key: &str) -> &str {
     key.get(..8).unwrap_or(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipnet::IpNet;
+
+    fn peer(public_key: &str, address: &str) -> wireguard::Peer {
+        wireguard::Peer {
+            public_key: public_key.into(),
+            endpoint: None,
+            allowed_ips: vec![address.parse::<IpNet>().unwrap()],
+            latest_handshake: 7_200,
+            receive_bytes: 0,
+            transmit_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn hub_pair_tickets_connect_endpoints_without_hub_as_remote() {
+        let left = peer("left-public-key", "192.168.38.2/32");
+        let right = peer("right-public-key", "192.168.38.3/32");
+        let (pair, next_issue) = plan_peer_pair(
+            "hub-public-key",
+            &left,
+            "192.168.38.2".parse().unwrap(),
+            &right,
+            "192.168.38.3".parse().unwrap(),
+            7_200,
+        )
+        .unwrap();
+        assert_eq!(pair.upstream.shortcut_id, pair.downstream.shortcut_id);
+        assert_eq!(pair.upstream.issuer_public_key, "hub-public-key");
+        assert_eq!(pair.upstream.recipient_public_key, "left-public-key");
+        assert_eq!(pair.upstream.remote_public_key, "right-public-key");
+        assert_eq!(pair.upstream.selector.to_string(), "192.168.38.3/32");
+        assert_eq!(pair.downstream.recipient_public_key, "right-public-key");
+        assert_eq!(pair.downstream.remote_public_key, "left-public-key");
+        assert_eq!(pair.downstream.selector.to_string(), "192.168.38.2/32");
+        assert!(!pair.upstream.remote_peer_id.contains("hub"));
+        assert_eq!(pair.upstream.renew_at, 7_320);
+        assert_eq!(pair.upstream.expires_at, 7_380);
+        assert_eq!(next_issue, 7_290);
+    }
+
+    #[test]
+    fn hub_issue_key_is_order_independent() {
+        assert_eq!(
+            ordered_hub_issue_key("left", "right"),
+            ordered_hub_issue_key("right", "left")
+        );
+    }
+
+    #[test]
+    fn hub_does_not_reissue_near_handshake_deadline() {
+        assert!(renewable_handshake(7_200, 7_200));
+        assert!(!renewable_handshake(7_200, 7_260));
+        assert!(fresh_handshake(7_200, 7_350));
+    }
 }

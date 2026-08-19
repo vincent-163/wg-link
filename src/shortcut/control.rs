@@ -53,6 +53,9 @@ pub enum ShortcutStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
+    Keepalive {
+        reply_requested: bool,
+    },
     Ticket {
         ticket: ShortcutTicket,
     },

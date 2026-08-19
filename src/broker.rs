@@ -137,6 +137,7 @@ pub async fn run_peer(
 
 pub async fn run_dispatcher(
     paths: HashMap<String, Arc<RwLock<PathSet>>>,
+    dynamic_targets: Vec<PathTarget>,
     metrics: MetricsRegistry,
     mut inbound: mpsc::Receiver<RelayPacket>,
     cancel: CancellationToken,
@@ -146,11 +147,14 @@ pub async fn run_dispatcher(
             _ = cancel.cancelled() => return Ok(()),
             packet = inbound.recv() => {
                 let Some(packet) = packet else { return Ok(()); };
-                let Some(path_set) = paths.get(&packet.peer_key) else {
-                    warn!(peer = %short(&packet.peer_key), "dropping dispatched packet for unknown peer");
-                    continue;
+                let targets = match paths.get(&packet.peer_key) {
+                    Some(path_set) => ordered_healthy_targets(&packet.peer_key, path_set, &metrics).await,
+                    None => dynamic_targets.clone(),
                 };
-                let targets = ordered_healthy_targets(&packet.peer_key, path_set, &metrics).await;
+                if targets.is_empty() {
+                    warn!(peer = %short(&packet.peer_key), "dropping dispatched packet because no dynamic EasyTier path is configured");
+                    continue;
+                }
                 let mut forwarded = false;
                 for target in targets {
                     if target.sender.send(packet.clone()).await.is_ok() {
@@ -213,6 +217,45 @@ mod tests {
         assert!(!paths.select(Some("missing")));
         assert!(paths.select(None));
         assert_eq!(paths.ordered_targets()[0].id, "one");
+    }
+
+    #[tokio::test]
+    async fn dynamic_peer_uses_shared_easytier_target() {
+        let (target_sender, mut target_receiver) = mpsc::channel(1);
+        let target = PathTarget {
+            id: "dynamic".into(),
+            label: "dynamic".into(),
+            protocol: "udp".into(),
+            sender: target_sender,
+        };
+        let (sender, receiver) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_dispatcher(
+            HashMap::new(),
+            vec![target],
+            MetricsRegistry::default(),
+            receiver,
+            cancel.clone(),
+        ));
+        sender
+            .send(RelayPacket {
+                peer_key: "dynamic-peer".into(),
+                channel: RelayChannel::ShortcutWireGuard {
+                    session: SessionKey {
+                        shortcut_id: crate::shortcut::control::ShortcutId([1; 16]),
+                        epoch: 1,
+                    },
+                },
+                payload: vec![1, 2, 3],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            target_receiver.recv().await.unwrap().peer_key,
+            "dynamic-peer"
+        );
+        cancel.cancel();
+        task.await.unwrap().unwrap();
     }
 }
 

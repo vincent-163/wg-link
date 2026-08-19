@@ -7,6 +7,11 @@ use crate::shortcut::{
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+pub struct DeviceEventOutcome {
+    pub activated: bool,
+    pub retired: Vec<SessionKey>,
+}
+
 pub struct ShortcutController<R> {
     local_public_key: String,
     manager: ShortcutManager<R>,
@@ -55,8 +60,12 @@ impl<R: RouteManager> ShortcutController<R> {
         Ok(prepared.session)
     }
 
-    pub fn handle_device_event(&mut self, event: &DeviceEvent, now: u64) -> Result<bool> {
-        match event {
+    pub fn handle_device_event(
+        &mut self,
+        event: &DeviceEvent,
+        now: u64,
+    ) -> Result<DeviceEventOutcome> {
+        let activated = match event {
             DeviceEvent::AuthenticatedHandshake { session } => {
                 self.manager.authenticated_handshake(*session, now)
             }
@@ -64,7 +73,13 @@ impl<R: RouteManager> ShortcutController<R> {
             | DeviceEvent::InnerPacket { .. }
             | DeviceEvent::MissingRoute { .. }
             | DeviceEvent::SessionFailed { .. } => Ok(false),
-        }
+        }?;
+        let retired = if activated {
+            self.manager.retire_draining()
+        } else {
+            Vec::new()
+        };
+        Ok(DeviceEventOutcome { activated, retired })
     }
 
     pub fn expire(&mut self, now: u64) -> Result<Vec<SessionKey>> {

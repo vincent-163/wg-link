@@ -276,26 +276,32 @@ through `A`; there is no preparation black hole.
 
 ## Lifetime and automatic renewal
 
-Shortcut authority follows WireGuard's handshake timing model:
+Hub-issued endpoint shortcut authority follows the Hub's authenticated
+WireGuard handshake timing model:
 
 - `renew-after`: 120 seconds;
-- `expires-at`: 180 seconds after the ticket epoch begins;
-- replacement preparation lead: 90 seconds before `renew-after`.
+- `expires-at`: 180 seconds after the ticket epoch begins, additionally capped
+  by the most recent Hub handshake deadline for both endpoints;
+- replacement preparation lead: 30 seconds before `renew-after`.
 
-Ninety seconds before renewal time, `A` sends a new one-way `RENEW` ticket with
-a fresh master secret and epoch to `L` and `B` through their base WireGuard
-paths. Sending the renewal itself keeps the base path active and triggers
-normal WireGuard rekeying when needed.
+Thirty seconds before renewal time, `A` first sends a lightweight keepalive to
+both endpoints through their base WireGuard paths. This deliberately refreshes
+the two `A`-side WireGuard handshakes before the new ticket is planned. After
+the refreshed handshake timestamps are observed, `A` sends a new one-way
+`RENEW` ticket with a fresh master secret and epoch to `L` and `B`. The ticket
+itself also traverses the base path.
 
 Each endpoint prepares the new ephemeral shortcut session beside the old one.
 After the new handshake succeeds, it atomically replaces the userspace route
-entry while the policy rule remains installed. The old epoch remains available
-until its lease expires, so a failed replacement can be retried without
-withdrawing the active policy route.
+entry while the policy rule remains installed, then immediately retires the
+old epoch's userspace session. This keeps only the authenticated replacement's
+WireGuard timers and outer traffic active, while a failed replacement leaves
+the old authenticated route untouched and eligible for retry.
 
-No acknowledgement RTT is required. If one side misses renewal, its current
-epoch expires at 180 seconds. Loss of direct authenticated handshakes, repeated
-transmit without receive progress, or expiry removes the policy rule
+No acknowledgement RTT is required. If the Hub goes offline, no replacement
+ticket can be issued; the current epoch therefore expires no later than the
+earlier Hub handshake deadline. Loss of direct authenticated handshakes,
+repeated transmit without receive progress, or expiry removes the policy rule
 immediately and returns traffic to `A`.
 
 `A` stops renewal when either base peer is removed, its relevant `AllowedIPs`
@@ -452,7 +458,8 @@ additional RTT is the direct WireGuard handshake between `L` and `B`.
 - one-hop `L -> A -> B` discovery;
 - userspace shortcut WireGuard inside the existing Rust process;
 - EasyTier peer-ID bootstrap plus direct UDP racing;
-- 120-second renewal and 180-second expiry;
+- 120-second renewal and 180-second expiry capped by the Hub handshake
+  deadline;
 - one active downstream owner per selector;
 - feature disabled by default behind `--shortcut-routing`;
 - hold-down after failure to prevent repeated first-packet storms.
@@ -474,7 +481,7 @@ Use three network namespaces or hosts with documentation address ranges:
    counters on `A` stop increasing;
 8. block direct UDP and verify the same shortcut WireGuard session continues
    through EasyTier peer-ID relay;
-9. stop renewal and verify policy removal and fallback through `A` no later
-   than the 180-second expiry;
+9. stop the Hub and verify policy removal and fallback through `A` no later
+   than the earlier Hub handshake deadline;
 10. kill `wg-linkd` and verify the non-persistent TUN disappears and the main
     WireGuard route remains unchanged.

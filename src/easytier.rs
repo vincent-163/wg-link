@@ -10,15 +10,16 @@ use async_trait::async_trait;
 use easytier::{
     common::config::TomlConfigLoader,
     instance::instance::Instance,
-    peers::PeerPacketFilter,
+    peers::{PeerPacketFilter, peer_manager::PeerManager},
     tunnel::packet_def::{PacketType, ZCPacket},
 };
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -29,6 +30,13 @@ const MAX_KEY_LEN: usize = 128;
 const SHORTCUT_CHANNEL: u8 = 1;
 const PROBE_REQUEST_CHANNEL: u8 = 2;
 const PROBE_RESPONSE_CHANNEL: u8 = 3;
+const MAX_IN_FLIGHT_PROBE_SENDS: usize = 8;
+
+#[derive(Debug)]
+struct ProbeSendResult {
+    request: Option<(u64, String)>,
+    error: Option<String>,
+}
 
 #[derive(Debug)]
 pub struct PeerRoute {
@@ -192,6 +200,7 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
 
     let mut peer_ids_by_hostname = HashMap::<String, u32>::new();
     let mut pending_probes = HashMap::<u64, (String, Instant)>::new();
+    let mut probe_sends = JoinSet::new();
     let mut next_probe_nonce = 1u64;
     let mut refresh = tokio::time::interval(Duration::from_secs(1));
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -277,11 +286,37 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
                     );
                     let mut packet = ZCPacket::new_with_payload(&frame);
                     packet.fill_peer_manager_hdr(peer_manager.my_peer_id(), dst_peer_id, PacketType::Data as u8);
-                    if peer_manager.send_msg_for_proxy(packet, dst_peer_id).await.is_ok() {
+                    if queue_probe_send(
+                        &mut probe_sends,
+                        peer_manager.clone(),
+                        packet,
+                        dst_peer_id,
+                        Some((nonce, peer.public_key.clone())),
+                    ) {
                         pending_probes.insert(nonce, (peer.public_key.clone(), now));
                     } else {
                         spec.metrics.record_probe(&peer.public_key, &spec.path_id, None);
+                        debug!(
+                            relay = %spec.relay,
+                            peer = %short(&peer.public_key),
+                            "dropping path probe because the bounded sender set is busy"
+                        );
                     }
+                }
+            }
+            result = probe_sends.join_next(), if !probe_sends.is_empty() => {
+                match result {
+                    Some(Ok(ProbeSendResult { request: Some((nonce, peer_key)), error: Some(error) })) => {
+                        if pending_probes.remove(&nonce).is_some() {
+                            spec.metrics.record_probe(&peer_key, &spec.path_id, None);
+                        }
+                        debug!(relay = %spec.relay, peer = %short(&peer_key), %error, "EasyTier path probe send failed");
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        warn!(relay = %spec.relay, %error, "EasyTier path probe sender task failed");
+                    }
+                    None => {}
                 }
             }
             probe = probe_rx.recv() => {
@@ -312,7 +347,19 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
                 );
                 let mut packet = ZCPacket::new_with_payload(&frame);
                 packet.fill_peer_manager_hdr(peer_manager.my_peer_id(), dst_peer_id, PacketType::Data as u8);
-                let _ = peer_manager.send_msg_for_proxy(packet, dst_peer_id).await;
+                if !queue_probe_send(
+                    &mut probe_sends,
+                    peer_manager.clone(),
+                    packet,
+                    dst_peer_id,
+                    None,
+                ) {
+                    debug!(
+                        relay = %spec.relay,
+                        peer = %short(&probe.source_key),
+                        "dropping path probe response because the bounded sender set is busy"
+                    );
+                }
             }
             packet = outbound.recv() => {
                 let Some(packet) = packet else { break; };
@@ -350,8 +397,31 @@ pub async fn run_relay(config: Config, spec: RelaySpec, cancel: CancellationToke
     let _ = discovery_task.await;
     lan_discovery_task.abort();
     let _ = lan_discovery_task.await;
+    probe_sends.abort_all();
+    while probe_sends.join_next().await.is_some() {}
     instance.clear_resources().await;
     Ok(())
+}
+
+fn queue_probe_send(
+    sends: &mut JoinSet<ProbeSendResult>,
+    peer_manager: Arc<PeerManager>,
+    packet: ZCPacket,
+    dst_peer_id: u32,
+    request: Option<(u64, String)>,
+) -> bool {
+    if sends.len() >= MAX_IN_FLIGHT_PROBE_SENDS {
+        return false;
+    }
+    sends.spawn(async move {
+        let error = peer_manager
+            .send_msg_for_proxy(packet, dst_peer_id)
+            .await
+            .err()
+            .map(|error| error.to_string());
+        ProbeSendResult { request, error }
+    });
+    true
 }
 
 pub async fn run_public_relay_service(port: u16) -> Result<()> {

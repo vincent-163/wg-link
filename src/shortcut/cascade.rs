@@ -25,6 +25,8 @@ pub struct CascadeRequest<'a> {
     pub upstream_selector: IpNet,
     pub downstream_selector: IpNet,
     pub parent: Option<&'a ActiveLease>,
+    pub expires_at_limit: Option<u64>,
+    pub renew_after_seconds: Option<u64>,
     pub now: u64,
 }
 
@@ -52,13 +54,17 @@ pub fn plan(request: CascadeRequest<'_>) -> Result<ShortcutTicketPair> {
     let expires_at = request
         .now
         .saturating_add(DEFAULT_EXPIRES_AFTER_SECONDS)
-        .min(request.parent.map_or(u64::MAX, |parent| parent.expires_at));
+        .min(request.parent.map_or(u64::MAX, |parent| parent.expires_at))
+        .min(request.expires_at_limit.unwrap_or(u64::MAX));
     if expires_at <= request.now.saturating_add(1) {
         bail!("parent shortcut lease is too close to expiry for delegation");
     }
+    let renew_after_seconds = request
+        .renew_after_seconds
+        .unwrap_or(DEFAULT_RENEW_AFTER_SECONDS);
     let renew_at = request
         .now
-        .saturating_add(DEFAULT_RENEW_AFTER_SECONDS)
+        .saturating_add(renew_after_seconds)
         .min(expires_at - 1);
 
     let common =
@@ -185,6 +191,8 @@ mod tests {
             upstream_selector: IpNet::from_str("198.51.100.7/32").unwrap(),
             downstream_selector: IpNet::from_str("203.0.113.1/32").unwrap(),
             parent: Some(&parent),
+            expires_at_limit: None,
+            renew_after_seconds: None,
             now: 1_000,
         })
         .unwrap();
@@ -225,6 +233,8 @@ mod tests {
                 upstream_selector: IpNet::from_str("198.51.100.7/32").unwrap(),
                 downstream_selector: IpNet::from_str("203.0.113.1/32").unwrap(),
                 parent: Some(&parent),
+                expires_at_limit: None,
+                renew_after_seconds: None,
                 now: 1_000,
             })
             .is_err()
